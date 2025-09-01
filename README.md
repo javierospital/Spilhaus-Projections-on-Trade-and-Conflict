@@ -11,14 +11,6 @@
 
 
 
-
- <p align="center">
-  <img src="maps/spilhaus_map_2.1.png" width="600"/>
-</p>
-
-
-
-
  <p align="center">
   <img src="maps/spilhaus_map_2.2.png" width="600"/>
 </p>
