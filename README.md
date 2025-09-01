@@ -2,8 +2,44 @@
 
 
 ## Summary
-maps/spilhaus_map_1.png
+
+ 
  <p align="center">
   <img src="maps/spilhaus_map_1.png" width="600"/>
 </p>
 
+
+
+
+
+
+ <p align="center">
+  <img src="maps/spilhaus_map_1" width="600"/>
+</p>
+
+
+
+
+ <p align="center">
+  <img src="maps/spilhaus_map_2.1" width="600"/>
+</p>
+
+
+
+
+ <p align="center">
+  <img src="maps/spilhaus_map_2.2" width="600"/>
+</p>
+
+
+
+ <p align="center">
+  <img src="maps/spilhaus_map_2.3" width="600"/>
+</p>
+
+
+
+
+ <p align="center">
+  <img src="maps/spilhaus_map_3" width="600"/>
+</p>
