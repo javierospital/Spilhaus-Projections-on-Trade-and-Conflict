@@ -1,4 +1,4 @@
-# Trade and Conflict over Spilhaus Proections 
+# Trade and Conflict over Spilhaus Projections 
 
 mention;  https://github.com/rtlemos/spilhaus/blob/main/spilhaus_sst.png  
 ## Summary
