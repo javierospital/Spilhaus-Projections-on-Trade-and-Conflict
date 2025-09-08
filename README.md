@@ -16,7 +16,7 @@ Since the relation between maritime trade and the US naval security guarantee ha
 </p>
 
 
-
+## Comparative Reach With and Without Dual-Purpose Ports 
 
  <p align="center">
   <img src="maps/spilhaus_map_2.2.png" width="700"/>
@@ -29,7 +29,7 @@ Since the relation between maritime trade and the US naval security guarantee ha
 </p>
 
 
-
+## Trade Routes Overlaid on Smoothed Maritime Influence Map
 
  <p align="center">
   <img src="maps/spilhaus_map_3.png" width="700"/>
