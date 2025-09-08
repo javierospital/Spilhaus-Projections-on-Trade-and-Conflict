@@ -1,0 +1,3181 @@
+---
+title: "Spilhaus Projections on Trade and Security 4"
+author: "Javier Ospital"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup}
+rm(list = ls())
+
+libs <- c("sf", "dplyr", "ggplot2", "purrr", "rerddap", "ncdf4", "units", "ggnewscale")
+invisible(lapply(setdiff(libs, installed.packages()[, "Package"]), install.packages))
+invisible(lapply(libs, library, character.only = TRUE))
+
+source("~/Downloads/spilhaus.R")
+```
+
+
+
+```{r land-mask-functions-2}
+if (!requireNamespace("rnaturalearth", quietly = TRUE)) {
+  install.packages("rnaturalearth")
+}
+library(rnaturalearth)
+
+land_sf <- rnaturalearth::ne_download(
+  scale = 110, type = "land", category = "physical", returnclass = "sf"
+)
+
+# Helper: vectorized land check (safe for NA lon/lat)
+is_land_vec <- function(lon, lat, land_sf) {
+  df <- data.frame(lon = lon, lat = lat)
+  good <- complete.cases(df) & is.finite(lon) & is.finite(lat)
+  
+  if (!any(good)) {
+    return(rep(FALSE, length(lon)))
+  }
+  
+  pts <- sf::st_as_sf(df[good, ], coords = c("lon", "lat"), crs = 4326)
+  inside <- lengths(sf::st_within(pts, land_sf)) > 0
+  
+  out <- rep(FALSE, length(lon))
+  out[good] <- inside
+  out
+}
+
+```
+
+```{r background-3}
+library(sf)
+library(rnaturalearth)
+
+# Load Natural Earth land polygons (1:110m scale for speed)
+land_sf <- rnaturalearth::ne_download(
+  scale = 110,
+  type = "land",
+  category = "physical",
+  returnclass = "sf"
+)
+
+# Repair invalid geometries so s2 can handle them
+land_sf <- st_make_valid(land_sf)
+
+# Helper: vectorized land check (safe for NA/Inf lon/lat)
+is_land_vec <- function(lon, lat, land_sf) {
+  df <- data.frame(lon = lon, lat = lat)
+  good <- complete.cases(df) & is.finite(lon) & is.finite(lat)
+  
+  if (!any(good)) {
+    return(rep(FALSE, length(lon)))
+  }
+  
+  pts <- sf::st_as_sf(df[good, ], coords = c("lon", "lat"), crs = 4326)
+  inside <- lengths(sf::st_within(pts, land_sf)) > 0
+  
+  out <- rep(FALSE, length(lon))
+  out[good] <- inside
+  out
+}
+
+# Build Spilhaus background grid
+grid_res  <- 1000
+spil_grid <- make_spilhaus_xy_gridpoints(grid_res)
+lonlat    <- from_spilhaus_xy_to_lonlat(spil_grid$x, spil_grid$y)
+
+# Classify as land/ocean
+spil_grid$land <- is_land_vec(lonlat[,1], lonlat[,2], land_sf)
+
+# Coastline grid
+coast_df       <- make_spilhaus_xy_gridpoints(grid_res)
+lonlat_coast   <- from_spilhaus_xy_to_lonlat(coast_df$x, coast_df$y)
+coast_df$land  <- is_land_vec(lonlat_coast[,1], lonlat_coast[,2], land_sf)
+
+
+# simplest: use your land mask as z
+spil_grid$z <- as.integer(spil_grid$land)
+
+# or, if you had another dataset to plot:
+# spil_grid$z <- extracted_values_from_raster
+
+coast_df$z <- as.integer(coast_df$land)
+
+bkgr  <- pretify_spilhaus_df(spil_grid)
+coast <- pretify_spilhaus_df(coast_df)
+
+
+```
+
+# 1.1 Shipping 
+```{r load-shipping}
+shipping_file <- "/Users/javieroctavioospitalgreslebin/Desktop/Chinese_Overseas_Ports/newzealandpaul/newzealandpaul-Shipping-Lanes-b0ad85c/data/Shipping-Lanes-v1/Shipping-Lanes-v1.shp"
+shipping_sf   <- st_read(shipping_file, quiet = TRUE)
+shipping_sf   <- st_make_valid(shipping_sf)
+shipping_sf   <- st_segmentize(shipping_sf, set_units(0.1, "degrees"))
+st_geometry(shipping_sf) <- st_wrap_dateline(
+  st_geometry(shipping_sf),
+  options = c("WRAPDATELINE=YES", "DATELINEOFFSET=180")
+)
+```
+
+```{r transform-and-segment-new}
+# Build coords with `type` from start and keep it throughout
+shipping_coords_raw <- purrr::map_dfr(seq_len(nrow(shipping_sf)), function(i) {
+  multiline <- st_geometry(shipping_sf)[[i]]
+  purrr::map_dfr(seq_along(multiline), function(j) {
+    coords <- multiline[[j]]
+    coords[, 1] <- ifelse(coords[, 1] > 180, coords[, 1] - 360, coords[, 1])
+    coords[, 1] <- ifelse(coords[, 1] < -180, coords[, 1] + 360, coords[, 1])
+    xy <- from_lonlat_to_spilhaus_xy(coords[, 1], coords[, 2])
+    data.frame(
+      x = xy[, 1], y = xy[, 2],
+      lon = coords[, 1], lat = coords[, 2],
+      original_id = paste0(i, "_", j),
+      seq_index = seq_along(xy[, 1]),
+      type = shipping_sf$Type[i]  # <-- keep Type here
+    )
+  })
+})
+
+shipping_coords_segmented <- shipping_coords_raw %>%
+  group_by(original_id, type) %>%  # keep type in grouping
+  mutate(dist_to_next = sqrt((x - lead(x))^2 + (y - lead(y))^2)) %>%
+  ungroup()
+
+jump_thresh <- quantile(shipping_coords_segmented$dist_to_next, 0.999, na.rm = TRUE)
+
+shipping_coords_segmented <- shipping_coords_segmented %>%
+  mutate(
+    is_break = ifelse(dist_to_next > jump_thresh, 1, 0),
+    is_break = coalesce(is_break, 0)
+  ) %>%
+  group_by(original_id, type) %>%  # keep type here too
+  mutate(segment_id = cumsum(is_break)) %>%
+  ungroup() %>%
+  mutate(id = paste(original_id, segment_id))
+```
+
+
+
+```{r mask-land-new-2}
+
+is_land_vec <- function(lon, lat, land_sf) {
+  df <- data.frame(lon = lon, lat = lat)
+  good <- complete.cases(df) & is.finite(lon) & is.finite(lat)
+  if (!any(good)) return(rep(FALSE, length(lon)))
+
+  pts <- sf::st_as_sf(df[good, ], coords = c("lon", "lat"), crs = 4326)
+  inside <- lengths(sf::st_within(pts, land_sf)) > 0
+
+  out <- rep(FALSE, length(lon))
+  out[good] <- inside
+  out
+}
+
+
+shipping_coords_masked <- shipping_coords_segmented %>%
+  group_by(id, type) %>%
+  mutate(
+    lon_next = lead(lon),
+    lat_next = lead(lat)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    on_land_start = is_land_vec(lon, lat, land_sf),
+    on_land_end   = is_land_vec(lon_next, lat_next, land_sf),
+    to_mask = on_land_start | on_land_end
+  ) %>%
+  filter(is.na(dist_to_next) | !to_mask)
+
+```
+
+
+```{r filter-canals-new-2}
+
+shipping_coords_masked <- shipping_coords_segmented %>%
+  group_by(id, type) %>%
+  mutate(
+    lon_next = lead(lon),
+    lat_next = lead(lat)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    on_land_start = is_land_vec(lon,     lat,     land_sf),
+    on_land_end   = is_land_vec(lon_next, lat_next, land_sf),
+    to_mask = on_land_start | on_land_end
+  ) %>%
+  filter(is.na(dist_to_next) | !to_mask)
+```
+
+
+
+```{r filter-canals-new-2.1}
+
+# --- SHIPPING DATA PREP ---
+
+shipping_sf   <- st_read(shipping_file, quiet = TRUE) |> st_make_valid()
+shipping_sf   <- st_segmentize(shipping_sf, set_units(0.1, "degrees"))
+
+# ✅ Wrap dateline BEFORE coordinate conversion
+st_geometry(shipping_sf) <- st_wrap_dateline(
+  st_geometry(shipping_sf),
+  options = c("WRAPDATELINE=YES", "DATELINEOFFSET=180")
+)
+
+# --- RAW COORDS ---
+shipping_coords_raw <- purrr::map_dfr(seq_len(nrow(shipping_sf)), function(i) {
+  multiline <- st_geometry(shipping_sf)[[i]]
+  purrr::map_dfr(seq_along(multiline), function(j) {
+    coords <- multiline[[j]]
+    # normalise longitude
+    coords[, 1] <- ifelse(coords[, 1] > 180, coords[, 1] - 360, coords[, 1])
+    coords[, 1] <- ifelse(coords[, 1] < -180, coords[, 1] + 360, coords[, 1])
+    xy <- from_lonlat_to_spilhaus_xy(coords[, 1], coords[, 2])
+    data.frame(
+      x = xy[, 1], y = xy[, 2],
+      lon = coords[, 1], lat = coords[, 2],
+      original_id = paste0(i, "_", j),
+      seq_index = seq_along(xy[, 1]),
+      type = shipping_sf$Type[i]
+    )
+  })
+})
+
+# --- SEGMENT ON JUMPS ---
+shipping_coords_segmented <- shipping_coords_raw %>%
+  group_by(original_id, type) %>%
+  mutate(dist_to_next = sqrt((x - lead(x))^2 + (y - lead(y))^2)) %>%
+  ungroup()
+
+jump_thresh <- quantile(shipping_coords_segmented$dist_to_next, 0.999, na.rm = TRUE)
+
+shipping_coords_segmented <- shipping_coords_segmented %>%
+  mutate(is_break = coalesce(ifelse(dist_to_next > jump_thresh, 1, 0), 0)) %>%
+  group_by(original_id, type) %>%
+  mutate(segment_id = cumsum(is_break)) %>%
+  ungroup() %>%
+  mutate(id = paste(original_id, segment_id))
+
+# --- LAND MASKING ---
+shipping_coords_masked <- shipping_coords_segmented %>%
+  group_by(id, type) %>%
+  mutate(
+    lon_next = lead(lon),
+    lat_next = lead(lat)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    on_land_start = is_land_vec(lon,      lat,      land_sf),
+    on_land_end   = is_land_vec(lon_next, lat_next, land_sf),
+    to_mask       = on_land_start | on_land_end
+  ) %>%
+  filter(is.na(dist_to_next) | !to_mask)
+```
+
+
+```{r filter-canals-new-2.2}
+
+# --- SHIPPING DATA PREP ---
+
+shipping_sf   <- st_read(shipping_file, quiet = TRUE) |> st_make_valid()
+shipping_sf   <- st_segmentize(shipping_sf, set_units(0.1, "degrees"))
+
+# ✅ Wrap dateline BEFORE coordinate conversion
+st_geometry(shipping_sf) <- st_wrap_dateline(
+  st_geometry(shipping_sf),
+  options = c("WRAPDATELINE=YES", "DATELINEOFFSET=180")
+)
+
+# --- RAW COORDS ---
+shipping_coords_raw <- purrr::map_dfr(seq_len(nrow(shipping_sf)), function(i) {
+  multiline <- st_geometry(shipping_sf)[[i]]
+  purrr::map_dfr(seq_along(multiline), function(j) {
+    coords <- multiline[[j]]
+    coords[, 1] <- ifelse(coords[, 1] > 180, coords[, 1] - 360, coords[, 1])
+    coords[, 1] <- ifelse(coords[, 1] < -180, coords[, 1] + 360, coords[, 1])
+    xy <- from_lonlat_to_spilhaus_xy(coords[, 1], coords[, 2])
+    data.frame(
+      x = xy[, 1], y = xy[, 2],
+      lon = coords[, 1], lat = coords[, 2],
+      original_id = paste0(i, "_", j),
+      seq_index = seq_along(xy[, 1]),
+      type = shipping_sf$Type[i]
+    )
+  })
+})
+
+# --- SEGMENT ON JUMPS ---
+shipping_coords_segmented <- shipping_coords_raw %>%
+  group_by(original_id, type) %>%
+  mutate(dist_to_next = sqrt((x - lead(x))^2 + (y - lead(y))^2)) %>%
+  ungroup()
+
+jump_thresh <- quantile(shipping_coords_segmented$dist_to_next, 0.999, na.rm = TRUE)
+
+shipping_coords_segmented <- shipping_coords_segmented %>%
+  mutate(is_break = coalesce(ifelse(dist_to_next > jump_thresh, 1, 0), 0)) %>%
+  group_by(original_id, type) %>%
+  mutate(segment_id = cumsum(is_break)) %>%
+  ungroup() %>%
+  mutate(id = paste(original_id, segment_id))
+
+# --- MASK AFTER SEGMENTING ---
+shipping_coords_masked <- shipping_coords_segmented %>%
+  group_by(id, type) %>%
+  mutate(lon_next = lead(lon),
+         lat_next = lead(lat)) %>%
+  ungroup() %>%
+  mutate(on_land_start = is_land_vec(lon,      lat,      land_sf),
+         on_land_end   = is_land_vec(lon_next, lat_next, land_sf),
+         to_mask       = on_land_start | on_land_end) %>%
+  filter(is.na(dist_to_next) | !to_mask)
+
+
+```
+
+
+# 1.2 Chokepoints and ports 
+
+
+```{r load-choekholds}
+
+choke_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_chokepoints_database/FeatureServer/0/",
+  "query?where=1=1&outFields=portid,portname,lat,lon,",
+  "vessel_count_total&f=geojson"
+)
+
+choke_raw <- sf::read_sf(choke_url)
+
+# Extract and convert to Spilhaus coordinates
+choke_df <- data.frame(
+  lon  = choke_raw$lon,
+  lat  = choke_raw$lat,
+  vcnt = choke_raw$vessel_count_total,
+  name = choke_raw$portname
+)
+choke_xy <- from_lonlat_to_spilhaus_xy(choke_df$lon, choke_df$lat)
+choke_df$x <- choke_xy[, 1]
+choke_df$y <- choke_xy[, 2]
+```
+
+```{r load-ports}
+
+# IMF Port Watch ports endpoint (GeoJSON)
+ports_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_ports_database/FeatureServer/0/",
+  "query?where=1=1&outFields=portid,portname,lat,lon,country&f=geojson"
+)
+
+ports_raw <- sf::read_sf(ports_url)
+
+# Prepare and project port coordinates
+ports_df <- data.frame(
+  lon     = ports_raw$lon,
+  lat     = ports_raw$lat,
+  name    = ports_raw$portname,
+  country = ports_raw$country,
+  stringsAsFactors = FALSE
+)
+ports_xy <- from_lonlat_to_spilhaus_xy(ports_df$lon, ports_df$lat)
+ports_df$x <- ports_xy[, 1]
+ports_df$y <- ports_xy[, 2]
+```
+
+
+
+
+# 1.3 Making map of Global Maritime Trade
+
+```{r preparing-labels}
+
+# 1. Define key geographic markers in lon/lat
+geo_labels_ll <- data.frame(
+  lon = c(80, -110, -20, 0),
+  lat = c(-30, -20, -40, 100),
+  label = c(
+            "Indian Ocean",
+            "Pacific Ocean",
+            "South Atlantic",
+            "Arctic Ocean"),
+  nudge_x = c( 0,  5,  1, 60),
+  nudge_y = c( -5, -3,  3,  -90)
+)
+
+
+# 2. Project to Spilhaus coordinates and name columns
+geo_xy <- from_lonlat_to_spilhaus_xy(geo_labels_ll$lon, geo_labels_ll$lat)
+colnames(geo_xy) <- c("x", "y")
+
+# Combine with labels
+geo_labels <- cbind(geo_labels_ll, geo_xy)
+
+
+# Filter chokepoints for high traffic
+choke_labels <- choke_df %>%
+  filter(vcnt >= 65000)
+```
+
+
+```{r map-global-maritime-trade-5}
+
+ggplot() +
+  geom_tile(data = bkgr, aes(x, y), fill = "#dbefff") +
+  geom_tile(data = bkgr[bkgr$land == TRUE, ], aes(x, y), fill = "gray90") +
+  geom_point(data = coast, aes(x, y), colour = "#dbefff", size = 0.1, pch = ".") +
+
+  # --- Shipping routes: use linewidth instead of size ---
+  geom_path(
+    data = shipping_coords_masked,
+    aes(x = x, y = y, group = id, linewidth = type),
+    colour = "dodgerblue", alpha = 0.3
+  ) +
+  scale_linewidth_manual(
+    name = "Type of shipping route",
+    values = c("Major" = 1.2, "Middle" = 0.7, "Minor" = 0.3)
+  ) +
+
+  # --- Chokepoints: size for vessel count ---
+  geom_point(data = choke_df,
+             aes(x = x, y = y, size = vcnt),
+             shape = 21, fill = NA, colour = "orange",
+             alpha = 0.7, stroke = 1) +
+  scale_size_continuous(
+    name = "Annual vessel count",
+    range = c(1, 10)
+  ) +
+
+  # --- Ports ---
+  geom_point(data = ports_df,
+             aes(x = x, y = y),
+             shape = 21, fill = "dodgerblue", colour = "black",
+             alpha = 0.3, size = 1, stroke = 0) +
+
+  # --- Labels ---
+  geom_text(data = geo_labels,
+            aes(x = x, y = y, label = label),
+            color = "gray60", fontface = "italic", size = 3) +
+  geom_text(data = choke_labels,
+            aes(x = x, y = y, label = name),
+            color = "gray30", size = 2.5, fontface = "bold", vjust = -3.5) +
+
+  coord_equal() + theme_void() +
+  theme(
+    panel.background = element_rect(fill = "gray100", colour = "gray80"),
+    plot.title = element_text(size = 15),
+    plot.caption = element_text(size = 10),
+    legend.position = "right",
+    legend.box = "vertical" # stack legends
+  ) +
+  labs(
+    title   = "Global Maritime Trade: Shipping routes, chokepoints and ports",
+    caption = "Data Sources: Benden, P. (2022), IMF PortWatch, and NOAA"
+  )
+```
+
+
+
+
+```{r map-global-maritime-trade-6}
+
+
+rm(list = ls())
+
+libs <- c("sf", "dplyr", "ggplot2", "purrr", "rerddap", "ncdf4", "units", "ggnewscale")
+invisible(lapply(setdiff(libs, installed.packages()[, "Package"]), install.packages))
+invisible(lapply(libs, library, character.only = TRUE))
+
+source("~/Downloads/spilhaus.R")
+
+
+
+
+
+
+
+
+if (!requireNamespace("rnaturalearth", quietly = TRUE)) {
+  install.packages("rnaturalearth")
+}
+library(rnaturalearth)
+
+land_sf <- rnaturalearth::ne_download(
+  scale = 110, type = "land", category = "physical", returnclass = "sf"
+) |> st_make_valid()
+
+# vectorized land check
+is_land_vec <- function(lon, lat, land_sf) {
+  df <- data.frame(lon = lon, lat = lat)
+  good <- complete.cases(df) & is.finite(lon) & is.finite(lat)
+  if (!any(good)) return(rep(FALSE, length(lon)))
+  pts <- st_as_sf(df[good, ], coords = c("lon", "lat"), crs = 4326)
+  inside <- lengths(st_within(pts, land_sf)) > 0
+  out <- rep(FALSE, length(lon))
+  out[good] <- inside
+  out
+}
+
+
+
+grid_res  <- 1000
+spil_grid <- make_spilhaus_xy_gridpoints(grid_res)
+lonlat    <- from_spilhaus_xy_to_lonlat(spil_grid$x, spil_grid$y)
+spil_grid$land <- is_land_vec(lonlat[,1], lonlat[,2], land_sf)
+spil_grid$z <- as.integer(spil_grid$land)
+
+coast_df <- make_spilhaus_xy_gridpoints(grid_res)
+lonlat_c <- from_spilhaus_xy_to_lonlat(coast_df$x, coast_df$y)
+coast_df$land <- is_land_vec(lonlat_c[,1], lonlat_c[,2], land_sf)
+coast_df$z <- as.integer(coast_df$land)
+
+bkgr  <- pretify_spilhaus_df(spil_grid)
+coast <- pretify_spilhaus_df(coast_df)
+
+
+
+shipping_file <- "/Users/javieroctavioospitalgreslebin/Desktop/Chinese_Overseas_Ports/newzealandpaul/newzealandpaul-Shipping-Lanes-b0ad85c/data/Shipping-Lanes-v1/Shipping-Lanes-v1.shp"
+
+shipping_sf   <- st_read(shipping_file, quiet = TRUE) |> st_make_valid()
+shipping_sf   <- st_segmentize(shipping_sf, set_units(0.1, "degrees"))
+
+# wrap dateline before projection
+st_geometry(shipping_sf) <- st_wrap_dateline(
+  st_geometry(shipping_sf),
+  options = c("WRAPDATELINE=YES", "DATELINEOFFSET=180")
+)
+
+# raw coords
+shipping_coords_raw <- purrr::map_dfr(seq_len(nrow(shipping_sf)), function(i) {
+  multiline <- st_geometry(shipping_sf)[[i]]
+  purrr::map_dfr(seq_along(multiline), function(j) {
+    coords <- multiline[[j]]
+    coords[,1] <- ifelse(coords[,1] > 180, coords[,1] - 360, coords[,1])
+    coords[,1] <- ifelse(coords[,1] < -180, coords[,1] + 360, coords[,1])
+    xy <- from_lonlat_to_spilhaus_xy(coords[,1], coords[,2])
+    data.frame(
+      x = xy[,1], y = xy[,2],
+      lon = coords[,1], lat = coords[,2],
+      original_id = paste0(i,"_",j),
+      seq_index = seq_along(xy[,1]),
+      type = shipping_sf$Type[i]
+    )
+  })
+})
+
+# segment on jumps
+shipping_coords_segmented <- shipping_coords_raw %>%
+  group_by(original_id, type) %>%
+  mutate(dist_to_next = sqrt((x - lead(x))^2 + (y - lead(y))^2)) %>%
+  ungroup()
+
+jump_thresh <- quantile(shipping_coords_segmented$dist_to_next, 0.999, na.rm = TRUE)
+
+shipping_coords_segmented <- shipping_coords_segmented %>%
+  mutate(is_break = coalesce(ifelse(dist_to_next > jump_thresh, 1, 0), 0)) %>%
+  group_by(original_id, type) %>%
+  mutate(segment_id = cumsum(is_break)) %>%
+  ungroup() %>%
+  mutate(id = paste(original_id, segment_id))
+
+# mask after segmenting
+shipping_coords_masked <- shipping_coords_segmented %>%
+  group_by(id, type) %>%
+  mutate(lon_next = lead(lon), lat_next = lead(lat)) %>%
+  ungroup() %>%
+  mutate(
+    on_land_start = is_land_vec(lon,      lat,      land_sf),
+    on_land_end   = is_land_vec(lon_next, lat_next, land_sf),
+    to_mask = on_land_start | on_land_end
+  ) %>%
+  filter(is.na(dist_to_next) | !to_mask)
+
+
+
+
+
+choke_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_chokepoints_database/FeatureServer/0/",
+  "query?where=1=1&outFields=portid,portname,lat,lon,",
+  "vessel_count_total&f=geojson"
+)
+
+choke_raw <- sf::read_sf(choke_url)
+
+# Extract and convert to Spilhaus coordinates
+choke_df <- data.frame(
+  lon  = choke_raw$lon,
+  lat  = choke_raw$lat,
+  vcnt = choke_raw$vessel_count_total,
+  name = choke_raw$portname
+)
+choke_xy <- from_lonlat_to_spilhaus_xy(choke_df$lon, choke_df$lat)
+choke_df$x <- choke_xy[, 1]
+choke_df$y <- choke_xy[, 2]
+
+
+
+
+# IMF Port Watch ports endpoint (GeoJSON)
+ports_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_ports_database/FeatureServer/0/",
+  "query?where=1=1&outFields=portid,portname,lat,lon,country&f=geojson"
+)
+
+ports_raw <- sf::read_sf(ports_url)
+
+# Prepare and project port coordinates
+ports_df <- data.frame(
+  lon     = ports_raw$lon,
+  lat     = ports_raw$lat,
+  name    = ports_raw$portname,
+  country = ports_raw$country,
+  stringsAsFactors = FALSE
+)
+ports_xy <- from_lonlat_to_spilhaus_xy(ports_df$lon, ports_df$lat)
+ports_df$x <- ports_xy[, 1]
+ports_df$y <- ports_xy[, 2]
+
+
+
+# 1. Define key geographic markers in lon/lat
+geo_labels_ll <- data.frame(
+  lon = c(80, -110, -20, 0),
+  lat = c(-30, -20, -40, 100),
+  label = c(
+            "Indian Ocean",
+            "Pacific Ocean",
+            "South Atlantic",
+            "Arctic Ocean"),
+  nudge_x = c( 0,  5,  1, 60),
+  nudge_y = c( -5, -3,  3,  -90)
+)
+
+
+# 2. Project to Spilhaus coordinates and name columns
+geo_xy <- from_lonlat_to_spilhaus_xy(geo_labels_ll$lon, geo_labels_ll$lat)
+colnames(geo_xy) <- c("x", "y")
+
+# Combine with labels
+geo_labels <- cbind(geo_labels_ll, geo_xy)
+
+
+# Filter chokepoints for high traffic
+choke_labels <- choke_df %>%
+  filter(vcnt >= 65000)
+
+
+
+
+ggplot() +
+  geom_tile(data = bkgr, aes(x, y), fill = "#dbefff") +
+  geom_tile(data = bkgr[bkgr$land == TRUE, ], aes(x, y), fill = "gray90") +
+  geom_point(data = coast, aes(x, y), colour = "#dbefff", size = 0.1, pch = ".") +
+
+  # --- Shipping routes: use linewidth instead of size ---
+  geom_path(
+    data = shipping_coords_masked,
+    aes(x = x, y = y, group = id, linewidth = type),
+    colour = "dodgerblue", alpha = 0.3
+  ) +
+  scale_linewidth_manual(
+    name = "Type of shipping route",
+    values = c("Major" = 1.2, "Middle" = 0.7, "Minor" = 0.3)
+  ) +
+
+  # --- Chokepoints: size for vessel count ---
+  geom_point(data = choke_df,
+             aes(x = x, y = y, size = vcnt),
+             shape = 21, fill = NA, colour = "orange",
+             alpha = 0.7, stroke = 1) +
+  scale_size_continuous(
+    name = "Annual vessel count",
+    range = c(1, 10)
+  ) +
+
+  # --- Ports ---
+  geom_point(data = ports_df,
+             aes(x = x, y = y),
+             shape = 21, fill = "dodgerblue", colour = "black",
+             alpha = 0.3, size = 1, stroke = 0) +
+
+  # --- Labels ---
+  geom_text(data = geo_labels,
+            aes(x = x, y = y, label = label),
+            color = "gray60", fontface = "italic", size = 3) +
+  geom_text(data = choke_labels,
+            aes(x = x, y = y, label = name),
+            color = "gray30", size = 2.5, fontface = "bold", vjust = -3.5) +
+
+  coord_equal() + theme_void() +
+  theme(
+    panel.background = element_rect(fill = "gray100", colour = "gray80"),
+    plot.title = element_text(size = 15),
+    plot.caption = element_text(size = 10),
+    legend.position = "right",
+    legend.box = "vertical" # stack legends
+  ) +
+  labs(
+    title   = "Global Maritime Trade: Shipping routes, chokepoints and ports",
+    caption = "Data Sources: Benden, P. (2022), IMF PortWatch, and NOAA"
+  )
+```
+
+```{r map-global-maritime-trade-7, message=FALSE}
+
+rm(list = ls())
+
+
+libs <- c("sf", "dplyr", "ggplot2", "purrr", "geosphere",
+          "rnaturalearth", "units", "ggnewscale", "tidyr")
+invisible(lapply(setdiff(libs, installed.packages()[,"Package"]), install.packages))
+invisible(lapply(libs, library, character.only = TRUE))
+
+source("~/Downloads/spilhaus.R")
+
+# --- Land polygons ---
+land_sf <- rnaturalearth::ne_download(
+  scale = 110, type = "land", category = "physical", returnclass = "sf"
+) |> st_make_valid()
+
+# Vectorised land check
+is_land_vec <- function(lon, lat, land_sf) {
+  df <- data.frame(lon = lon, lat = lat)
+  good <- complete.cases(df) & is.finite(lon) & is.finite(lat)
+  if (!any(good)) return(rep(FALSE, length(lon)))
+  pts <- st_as_sf(df[good, ], coords = c("lon", "lat"), crs = 4326)
+  inside <- lengths(st_within(pts, land_sf)) > 0
+  out <- rep(FALSE, length(lon))
+  out[good] <- inside
+  out
+}
+
+# --- Background grid ---
+grid_res  <- 1000
+spil_grid <- make_spilhaus_xy_gridpoints(grid_res)
+lonlat    <- from_spilhaus_xy_to_lonlat(spil_grid$x, spil_grid$y)
+spil_grid$land <- is_land_vec(lonlat[,1], lonlat[,2], land_sf)
+spil_grid$z <- as.integer(spil_grid$land)
+
+coast_df <- make_spilhaus_xy_gridpoints(grid_res)
+lonlat_c <- from_spilhaus_xy_to_lonlat(coast_df$x, coast_df$y)
+coast_df$land <- is_land_vec(lonlat_c[,1], lonlat_c[,2], land_sf)
+coast_df$z <- as.integer(coast_df$land)
+
+bkgr  <- pretify_spilhaus_df(spil_grid)
+coast <- pretify_spilhaus_df(coast_df)
+
+# --- Shipping lanes ---
+shipping_file <- "/Users/javieroctavioospitalgreslebin/Desktop/Chinese_Overseas_Ports/newzealandpaul/newzealandpaul-Shipping-Lanes-b0ad85c/data/Shipping-Lanes-v1/Shipping-Lanes-v1.shp"
+
+
+shipping_sf <- st_read(shipping_file, quiet = TRUE) |> st_make_valid()
+shipping_sf <- st_segmentize(shipping_sf, set_units(0.1, "degrees"))
+
+# Wrap dateline in geographic space
+st_geometry(shipping_sf) <- st_wrap_dateline(
+  st_geometry(shipping_sf),
+  options = c("WRAPDATELINE=YES", "DATELINEOFFSET=180")
+)
+
+# Build coords in lon/lat, split on great-circle jumps
+shipping_coords_ll <- purrr::map_dfr(seq_len(nrow(shipping_sf)), function(i) {
+  multiline <- st_geometry(shipping_sf)[[i]]
+  purrr::map_dfr(seq_along(multiline), function(j) {
+    coords <- multiline[[j]]
+    # ensure longitudes in [-180, 180]
+    coords[,1] <- ifelse(coords[,1] > 180, coords[,1] - 360, coords[,1])
+    coords[,1] <- ifelse(coords[,1] < -180, coords[,1] + 360, coords[,1])
+
+    # great-circle distances (in meters)
+    gc_dist <- c(NA, geosphere::distGeo(coords[-nrow(coords),], coords[-1,]))
+    # threshold for breaks (e.g., 2000 km)
+    is_break <- ifelse(gc_dist > 2e6, 1, 0)
+
+    data.frame(
+      lon = coords[,1],
+      lat = coords[,2],
+      original_id = paste0(i,"_",j),
+      seq_index = seq_len(nrow(coords)),
+      is_break = is_break,
+      type = shipping_sf$Type[i]
+    )
+  })
+})
+
+# Assign segment IDs in geographic space
+shipping_coords_ll <- shipping_coords_ll %>%
+  group_by(original_id) %>%
+  mutate(segment_id = cumsum(replace_na(is_break, 0)),
+         id = paste(original_id, segment_id)) %>%
+  ungroup()
+
+# Project to Spilhaus after splitting
+xy <- from_lonlat_to_spilhaus_xy(shipping_coords_ll$lon, shipping_coords_ll$lat)
+shipping_coords_ll$x <- xy[,1]
+shipping_coords_ll$y <- xy[,2]
+
+# Land masking (now on already-split segments)
+shipping_coords_masked <- shipping_coords_ll %>%
+  group_by(id, type) %>%
+  mutate(lon_next = lead(lon), lat_next = lead(lat)) %>%
+  ungroup() %>%
+  mutate(
+    on_land_start = is_land_vec(lon,      lat,      land_sf),
+    on_land_end   = is_land_vec(lon_next, lat_next, land_sf),
+    to_mask = on_land_start | on_land_end
+  ) %>%
+  filter(!to_mask | is.na(to_mask))
+
+# --- Chokepoints ---
+choke_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_chokepoints_database/FeatureServer/0/",
+  "query?where=1=1&outFields=portid,portname,lat,lon,",
+  "vessel_count_total&f=geojson"
+)
+choke_raw <- sf::read_sf(choke_url)
+choke_df <- data.frame(
+  lon = choke_raw$lon,
+  lat = choke_raw$lat,
+  vcnt = choke_raw$vessel_count_total,
+  name = choke_raw$portname
+)
+choke_xy <- from_lonlat_to_spilhaus_xy(choke_df$lon, choke_df$lat)
+choke_df$x <- choke_xy[,1]; choke_df$y <- choke_xy[,2]
+
+# --- Ports ---
+ports_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_ports_database/FeatureServer/0/",
+  "query?where=1=1&outFields=portid,portname,lat,lon,country&f=geojson"
+)
+ports_raw <- sf::read_sf(ports_url)
+ports_df <- data.frame(
+  lon = ports_raw$lon,
+  lat = ports_raw$lat,
+  name = ports_raw$portname,
+  country = ports_raw$country
+)
+ports_xy <- from_lonlat_to_spilhaus_xy(ports_df$lon, ports_df$lat)
+ports_df$x <- ports_xy[,1]; ports_df$y <- ports_xy[,2]
+
+# --- Labels 1 ---
+geo_labels_ll <- data.frame(
+  lon = c(80, -110, -20, 0),
+  lat = c(-30, -20, -40, 100),
+  label = c("Indian Ocean", "Pacific Ocean", "South Atlantic", "Arctic Ocean")
+)
+geo_xy <- from_lonlat_to_spilhaus_xy(geo_labels_ll$lon, geo_labels_ll$lat)
+geo_labels <- cbind(geo_labels_ll, geo_xy)
+choke_labels <- choke_df %>% filter(vcnt >= 65000)
+
+
+# --- Labels 2 ---
+geo_labels_ll <- data.frame(
+  lon = c(80, -110, -20, 0),
+  lat = c(-30, -20, -40, 100),
+  label = c("Indian Ocean", "Pacific Ocean", "South Atlantic", "Arctic Ocean"),
+  nudge_x = c(0, 5, 1, 60),
+  nudge_y = c(-5, -3, 3, -90)
+)
+
+geo_xy <- from_lonlat_to_spilhaus_xy(geo_labels_ll$lon, geo_labels_ll$lat)
+colnames(geo_xy) <- c("x", "y")
+
+# Combine lon/lat/label/nudges with Spilhaus coords
+geo_labels <- cbind(geo_labels_ll, geo_xy)
+
+          
+          
+# --- Plot ---
+
+ggplot() +
+  geom_tile(data = bkgr, aes(x, y), fill = "#dbefff") +
+  geom_tile(data = bkgr[bkgr$land == TRUE, ], aes(x, y), fill = "gray90") +
+  geom_point(data = coast, aes(x, y), colour = "#dbefff", size = 0.1, pch = ".") +
+
+  # --- Shipping routes: use linewidth instead of size ---
+  geom_path(
+    data = shipping_coords_masked,
+    aes(x = x, y = y, group = id, linewidth = type),
+    colour = "dodgerblue", alpha = 0.3
+  ) +
+  scale_linewidth_manual(
+    name = "Type of shipping route",
+    values = c("Major" = 1.2, "Middle" = 0.7, "Minor" = 0.3)
+  ) +
+
+  # --- Chokepoints: size for vessel count ---
+  geom_point(data = choke_df,
+             aes(x = x, y = y, size = vcnt),
+             shape = 21, fill = NA, colour = "orange",
+             alpha = 0.7, stroke = 1) +
+  scale_size_continuous(
+    name = "Annual vessel count",
+    range = c(1, 10)
+  ) +
+
+  # --- Ports ---
+  geom_point(data = ports_df,
+             aes(x = x, y = y),
+             shape = 21, fill = "dodgerblue", colour = "black",
+             alpha = 0.3, size = 1, stroke = 0) +
+
+  # --- Labels ---
+  geom_text(data = geo_labels,
+            aes(x = x, y = y, label = label),
+            color = "gray60", fontface = "italic", size = 3) +
+  geom_text(data = choke_labels,
+            aes(x = x, y = y, label = name),
+            color = "gray30", size = 2.5, fontface = "bold", vjust = -3.5) +
+
+  coord_equal() + theme_void() +
+  theme(
+    panel.background = element_rect(fill = "gray100", colour = "gray80"),
+    plot.title = element_text(size = 15),
+    plot.caption = element_text(size = 10),
+    legend.position = "right",
+    legend.box = "vertical" # stack legends
+  ) +
+  labs(
+    title   = "Global Maritime Trade: Shipping routes, chokepoints and ports",
+    caption = "Data Sources: Benden, P. (2022), IMF PortWatch, and NOAA"
+  )
+
+        
+        
+```
+
+
+```{r map-global-maritime-trade-7, message=FALSE}
+
+rm(list = ls())
+
+
+libs <- c("sf", "dplyr", "ggplot2", "purrr", "geosphere",
+          "rnaturalearth", "units", "ggnewscale", "tidyr")
+invisible(lapply(setdiff(libs, installed.packages()[,"Package"]), install.packages))
+invisible(lapply(libs, library, character.only = TRUE))
+
+source("~/Downloads/spilhaus.R")
+
+# --- Land polygons ---
+land_sf <- rnaturalearth::ne_download(
+  scale = 110, type = "land", category = "physical", returnclass = "sf"
+) |> st_make_valid()
+
+# Vectorised land check
+is_land_vec <- function(lon, lat, land_sf) {
+  df <- data.frame(lon = lon, lat = lat)
+  good <- complete.cases(df) & is.finite(lon) & is.finite(lat)
+  if (!any(good)) return(rep(FALSE, length(lon)))
+  pts <- st_as_sf(df[good, ], coords = c("lon", "lat"), crs = 4326)
+  inside <- lengths(st_within(pts, land_sf)) > 0
+  out <- rep(FALSE, length(lon))
+  out[good] <- inside
+  out
+}
+
+# --- Background grid ---
+grid_res  <- 1000
+spil_grid <- make_spilhaus_xy_gridpoints(grid_res)
+lonlat    <- from_spilhaus_xy_to_lonlat(spil_grid$x, spil_grid$y)
+spil_grid$land <- is_land_vec(lonlat[,1], lonlat[,2], land_sf)
+spil_grid$z <- as.integer(spil_grid$land)
+
+coast_df <- make_spilhaus_xy_gridpoints(grid_res)
+lonlat_c <- from_spilhaus_xy_to_lonlat(coast_df$x, coast_df$y)
+coast_df$land <- is_land_vec(lonlat_c[,1], lonlat_c[,2], land_sf)
+coast_df$z <- as.integer(coast_df$land)
+
+bkgr  <- pretify_spilhaus_df(spil_grid)
+coast <- pretify_spilhaus_df(coast_df)
+
+# --- Shipping lanes ---
+shipping_file <- "/Users/javieroctavioospitalgreslebin/Desktop/Chinese_Overseas_Ports/newzealandpaul/newzealandpaul-Shipping-Lanes-b0ad85c/data/Shipping-Lanes-v1/Shipping-Lanes-v1.shp"
+
+
+shipping_sf <- st_read(shipping_file, quiet = TRUE) |> st_make_valid()
+shipping_sf <- st_segmentize(shipping_sf, set_units(0.1, "degrees"))
+
+# Wrap dateline in geographic space
+st_geometry(shipping_sf) <- st_wrap_dateline(
+  st_geometry(shipping_sf),
+  options = c("WRAPDATELINE=YES", "DATELINEOFFSET=180")
+)
+
+# Build coords in lon/lat, split on great-circle jumps
+shipping_coords_ll <- purrr::map_dfr(seq_len(nrow(shipping_sf)), function(i) {
+  multiline <- st_geometry(shipping_sf)[[i]]
+  purrr::map_dfr(seq_along(multiline), function(j) {
+    coords <- multiline[[j]]
+    # ensure longitudes in [-180, 180]
+    coords[,1] <- ifelse(coords[,1] > 180, coords[,1] - 360, coords[,1])
+    coords[,1] <- ifelse(coords[,1] < -180, coords[,1] + 360, coords[,1])
+
+    # great-circle distances (in meters)
+    gc_dist <- c(NA, geosphere::distGeo(coords[-nrow(coords),], coords[-1,]))
+    # threshold for breaks (e.g., 2000 km)
+    is_break <- ifelse(gc_dist > 2e6, 1, 0)
+
+    data.frame(
+      lon = coords[,1],
+      lat = coords[,2],
+      original_id = paste0(i,"_",j),
+      seq_index = seq_len(nrow(coords)),
+      is_break = is_break,
+      type = shipping_sf$Type[i]
+    )
+  })
+})
+
+# Assign segment IDs in geographic space
+shipping_coords_ll <- shipping_coords_ll %>%
+  group_by(original_id) %>%
+  mutate(segment_id = cumsum(replace_na(is_break, 0)),
+         id = paste(original_id, segment_id)) %>%
+  ungroup()
+
+# Project to Spilhaus after splitting
+xy <- from_lonlat_to_spilhaus_xy(shipping_coords_ll$lon, shipping_coords_ll$lat)
+shipping_coords_ll$x <- xy[,1]
+shipping_coords_ll$y <- xy[,2]
+
+# Land masking (now on already-split segments)
+shipping_coords_masked <- shipping_coords_ll %>%
+  group_by(id, type) %>%
+  mutate(lon_next = lead(lon), lat_next = lead(lat)) %>%
+  ungroup() %>%
+  mutate(
+    on_land_start = is_land_vec(lon,      lat,      land_sf),
+    on_land_end   = is_land_vec(lon_next, lat_next, land_sf),
+    to_mask = on_land_start | on_land_end
+  ) %>%
+  filter(!to_mask | is.na(to_mask))
+
+# --- Chokepoints ---
+choke_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_chokepoints_database/FeatureServer/0/",
+  "query?where=1=1&outFields=portid,portname,lat,lon,",
+  "vessel_count_total&f=geojson"
+)
+choke_raw <- sf::read_sf(choke_url)
+choke_df <- data.frame(
+  lon = choke_raw$lon,
+  lat = choke_raw$lat,
+  vcnt = choke_raw$vessel_count_total,
+  name = choke_raw$portname
+)
+choke_xy <- from_lonlat_to_spilhaus_xy(choke_df$lon, choke_df$lat)
+choke_df$x <- choke_xy[,1]; choke_df$y <- choke_xy[,2]
+
+# --- Ports ---
+ports_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_ports_database/FeatureServer/0/",
+  "query?where=1=1&outFields=portid,portname,lat,lon,country&f=geojson"
+)
+ports_raw <- sf::read_sf(ports_url)
+ports_df <- data.frame(
+  lon = ports_raw$lon,
+  lat = ports_raw$lat,
+  name = ports_raw$portname,
+  country = ports_raw$country
+)
+ports_xy <- from_lonlat_to_spilhaus_xy(ports_df$lon, ports_df$lat)
+ports_df$x <- ports_xy[,1]; ports_df$y <- ports_xy[,2]
+
+# --- Labels 1 ---
+geo_labels_ll <- data.frame(
+  lon = c(80, -110, -20, 0),
+  lat = c(-30, -20, -40, 100),
+  label = c("Indian Ocean", "Pacific Ocean", "South Atlantic", "Arctic Ocean")
+)
+geo_xy <- from_lonlat_to_spilhaus_xy(geo_labels_ll$lon, geo_labels_ll$lat)
+geo_labels <- cbind(geo_labels_ll, geo_xy)
+choke_labels <- choke_df %>% filter(vcnt >= 65000)
+
+
+# --- Labels 2 ---
+geo_labels_ll <- data.frame(
+  lon = c(80, -110, -20, 0),
+  lat = c(-30, -20, -40, 100),
+  label = c("Indian Ocean", "Pacific Ocean", "South Atlantic", "Arctic Ocean"),
+  nudge_x = c(0, 5, 1, 60),
+  nudge_y = c(-5, -3, 3, -90)
+)
+
+geo_xy <- from_lonlat_to_spilhaus_xy(geo_labels_ll$lon, geo_labels_ll$lat)
+colnames(geo_xy) <- c("x", "y")
+
+# Combine lon/lat/label/nudges with Spilhaus coords
+geo_labels <- cbind(geo_labels_ll, geo_xy)
+
+          
+          
+# --- Plot ---
+
+ggplot() +
+  geom_tile(data = bkgr, aes(x, y), fill = "#dbefff") +
+  geom_tile(data = bkgr[bkgr$land == TRUE, ], aes(x, y), fill = "gray90") +
+  geom_point(data = coast, aes(x, y), colour = "#dbefff", size = 0.1, pch = ".") +
+
+  # --- Shipping routes: use linewidth instead of size ---
+  geom_path(
+    data = shipping_coords_masked,
+    aes(x = x, y = y, group = id, linewidth = type),
+    colour = "dodgerblue", alpha = 0.3
+  ) +
+  scale_linewidth_manual(
+    name = "Type of shipping route",
+    values = c("Major" = 1.2, "Middle" = 0.7, "Minor" = 0.3)
+  ) +
+
+  # --- Chokepoints: size for vessel count ---
+  geom_point(data = choke_df,
+             aes(x = x, y = y, size = vcnt),
+             shape = 21, fill = NA, colour = "orange",
+             alpha = 0.7, stroke = 1) +
+  scale_size_continuous(
+    name = "Annual vessel count",
+    range = c(1, 10)
+  ) +
+
+  # --- Ports ---
+  geom_point(data = ports_df,
+             aes(x = x, y = y),
+             shape = 21, fill = "dodgerblue", colour = "black",
+             alpha = 0.3, size = 1, stroke = 0) +
+
+  # --- Labels ---
+  geom_text(data = geo_labels,
+            aes(x = x, y = y, label = label),
+            color = "gray60", fontface = "italic", size = 3) +
+  geom_text(data = choke_labels,
+            aes(x = x, y = y, label = name),
+            color = "gray30", size = 2.5, fontface = "bold", vjust = -3.5) +
+
+  coord_equal() + theme_void() +
+  theme(
+    panel.background = element_rect(fill = "gray100", colour = "gray80"),
+    plot.title = element_text(size = 15),
+    plot.caption = element_text(size = 10),
+    legend.position = "right",
+    legend.box = "vertical" # stack legends
+  ) +
+  labs(
+    title   = "Global Maritime Trade: Shipping routes, chokepoints and ports",
+    caption = "Data Sources: Benden, P. (2022), IMF PortWatch, and NOAA"
+  )
+
+        
+        
+```
+
+
+
+```{r map-global-maritime-trade-8, message=FALSE}
+
+rm(list = ls())
+
+libs <- c("sf", "dplyr", "ggplot2", "purrr", "geosphere",
+          "rnaturalearth", "units", "ggnewscale", "tidyr")
+invisible(lapply(setdiff(libs, installed.packages()[,"Package"]), install.packages))
+invisible(lapply(libs, library, character.only = TRUE))
+
+source("~/Downloads/spilhaus.R")
+
+# --- Land polygons ---
+land_sf <- rnaturalearth::ne_download(
+  scale = 110, type = "land", category = "physical", returnclass = "sf"
+) |> st_make_valid()
+
+# Vectorised land check
+is_land_vec <- function(lon, lat, land_sf) {
+  df <- data.frame(lon = lon, lat = lat)
+  good <- complete.cases(df) & is.finite(lon) & is.finite(lat)
+  if (!any(good)) return(rep(FALSE, length(lon)))
+  pts <- st_as_sf(df[good, ], coords = c("lon", "lat"), crs = 4326)
+  inside <- lengths(st_within(pts, land_sf)) > 0
+  out <- rep(FALSE, length(lon))
+  out[good] <- inside
+  out
+}
+
+# --- Background grid ---
+grid_res  <- 1000
+spil_grid <- make_spilhaus_xy_gridpoints(grid_res)
+lonlat    <- from_spilhaus_xy_to_lonlat(spil_grid$x, spil_grid$y)
+spil_grid$land <- is_land_vec(lonlat[,1], lonlat[,2], land_sf)
+spil_grid$z <- as.integer(spil_grid$land)
+
+coast_df <- make_spilhaus_xy_gridpoints(grid_res)
+lonlat_c <- from_spilhaus_xy_to_lonlat(coast_df$x, coast_df$y)
+coast_df$land <- is_land_vec(lonlat_c[,1], lonlat_c[,2], land_sf)
+coast_df$z <- as.integer(coast_df$land)
+
+bkgr  <- pretify_spilhaus_df(spil_grid)
+coast <- pretify_spilhaus_df(coast_df)
+
+# --- Shipping lanes ---
+shipping_file <- "/Users/javieroctavioospitalgreslebin/Desktop/Chinese_Overseas_Ports/newzealandpaul/newzealandpaul-Shipping-Lanes-b0ad85c/data/Shipping-Lanes-v1/Shipping-Lanes-v1.shp"
+
+shipping_sf <- st_read(shipping_file, quiet = TRUE) |> st_make_valid()
+shipping_sf <- st_segmentize(shipping_sf, set_units(0.1, "degrees"))
+
+# Wrap dateline in geographic space
+st_geometry(shipping_sf) <- st_wrap_dateline(
+  st_geometry(shipping_sf),
+  options = c("WRAPDATELINE=YES", "DATELINEOFFSET=180")
+)
+
+# Build coords in lon/lat, split on great-circle jumps
+shipping_coords_ll <- purrr::map_dfr(seq_len(nrow(shipping_sf)), function(i) {
+  multiline <- st_geometry(shipping_sf)[[i]]
+  purrr::map_dfr(seq_along(multiline), function(j) {
+    coords <- multiline[[j]]
+    # ensure longitudes in [-180, 180]
+    coords[,1] <- ifelse(coords[,1] > 180, coords[,1] - 360, coords[,1])
+    coords[,1] <- ifelse(coords[,1] < -180, coords[,1] + 360, coords[,1])
+
+    # great-circle distances (in meters)
+    gc_dist <- c(NA, geosphere::distGeo(coords[-nrow(coords),], coords[-1,]))
+    # threshold for breaks (more robust: 3500 km)
+    is_break <- ifelse(gc_dist > 3.5e6, 1, 0)
+
+    data.frame(
+      lon = coords[,1],
+      lat = coords[,2],
+      original_id = paste0(i,"_",j),
+      seq_index = seq_len(nrow(coords)),
+      is_break = is_break,
+      type = shipping_sf$Type[i]
+    )
+  })
+})
+
+# Assign segment IDs in geographic space
+shipping_coords_ll <- shipping_coords_ll %>%
+  group_by(original_id) %>%
+  mutate(segment_id = cumsum(tidyr::replace_na(is_break, 0)),
+         id = paste(original_id, segment_id)) %>%
+  ungroup()
+
+# Project to Spilhaus after splitting
+xy <- from_lonlat_to_spilhaus_xy(shipping_coords_ll$lon, shipping_coords_ll$lat)
+shipping_coords_ll$x <- xy[,1]
+shipping_coords_ll$y <- xy[,2]
+
+# Land masking (on already-split segments)
+shipping_coords_masked <- shipping_coords_ll %>%
+  group_by(id, type) %>%
+  mutate(lon_next = lead(lon), lat_next = lead(lat)) %>%
+  ungroup() %>%
+  mutate(
+    on_land_start = is_land_vec(lon,      lat,      land_sf),
+    on_land_end   = is_land_vec(lon_next, lat_next, land_sf),
+    to_mask = on_land_start | on_land_end
+  ) %>%
+  filter(!to_mask | is.na(to_mask))
+
+# Recompute plot grouping after masking to avoid bridging over removed points
+shipping_coords_masked <- shipping_coords_masked %>%
+  group_by(original_id) %>%
+  mutate(new_seg_id = cumsum(c(0, diff(seq_index) != 1)),
+         plot_id    = paste(original_id, new_seg_id)) %>%
+  ungroup()
+
+# --- Chokepoints ---
+choke_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_chokepoints_database/FeatureServer/0/",
+  "query?where=1=1&outFields=portid,portname,lat,lon,",
+  "vessel_count_total&f=geojson"
+)
+choke_raw <- sf::read_sf(choke_url)
+choke_df <- data.frame(
+  lon = choke_raw$lon,
+  lat = choke_raw$lat,
+  vcnt = choke_raw$vessel_count_total,
+  name = choke_raw$portname
+)
+choke_xy <- from_lonlat_to_spilhaus_xy(choke_df$lon, choke_df$lat)
+choke_df$x <- choke_xy[,1]; choke_df$y <- choke_xy[,2]
+
+# --- Ports ---
+ports_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_ports_database/FeatureServer/0/",
+  "query?where=1=1&outFields=portid,portname,lat,lon,country&f=geojson"
+)
+ports_raw <- sf::read_sf(ports_url)
+ports_df <- data.frame(
+  lon = ports_raw$lon,
+  lat = ports_raw$lat,
+  name = ports_raw$portname,
+  country = ports_raw$country
+)
+ports_xy <- from_lonlat_to_spilhaus_xy(ports_df$lon, ports_df$lat)
+ports_df$x <- ports_xy[,1]; ports_df$y <- ports_xy[,2]
+
+# --- Labels (keep your existing v7 structure untouched) ---
+# Labels 1
+geo_labels_ll <- data.frame(
+  lon = c(80, -110, -20, 0),
+  lat = c(-30, -20, -40, 100),
+  label = c("Indian Ocean", "Pacific Ocean", "South Atlantic", "Arctic Ocean")
+)
+geo_xy <- from_lonlat_to_spilhaus_xy(geo_labels_ll$lon, geo_labels_ll$lat)
+geo_labels <- cbind(geo_labels_ll, geo_xy)
+choke_labels <- choke_df %>% filter(vcnt >= 65000)
+
+# Labels 2
+geo_labels_ll <- data.frame(
+  lon = c(80, -110, -20, 0),
+  lat = c(-30, -20, -40, 100),
+  label = c("Indian Ocean", "Pacific Ocean", "South Atlantic", "Arctic Ocean"),
+  nudge_x = c(0, 5, 1, 60),
+  nudge_y = c(-5, -3, 3, -90)
+)
+geo_xy <- from_lonlat_to_spilhaus_xy(geo_labels_ll$lon, geo_labels_ll$lat)
+colnames(geo_xy) <- c("x", "y")
+geo_labels <- cbind(geo_labels_ll, geo_xy)
+
+# --- Plot ---
+ggplot() +
+  geom_tile(data = bkgr, aes(x, y), fill = "#dbefff") +
+  geom_tile(data = bkgr[bkgr$land == TRUE, ], aes(x, y), fill = "gray90") +
+  geom_point(data = coast, aes(x, y), colour = "#dbefff", size = 0.1, pch = ".") +
+
+  geom_path(
+    data = shipping_coords_masked,
+    aes(x = x, y = y, group = plot_id, linewidth = type),
+    colour = "dodgerblue", alpha = 0.3
+  ) +
+  scale_linewidth_manual(
+    name = "Type of shipping route",
+    values = c("Major" = 1.2, "Middle" = 0.7, "Minor" = 0.3)
+  ) +
+
+  geom_point(data = choke_df,
+             aes(x = x, y = y, size = vcnt),
+             shape = 21, fill = NA, colour = "orange",
+             alpha = 0.7, stroke = 1) +
+  scale_size_continuous(
+    name = "Annual vessel count",
+    range = c(1, 10)
+  ) +
+
+  geom_point(data = ports_df,
+             aes(x = x, y = y),
+             shape = 21, fill = "dodgerblue", colour = "black",
+             alpha = 0.3, size = 1, stroke = 0) +
+
+  geom_text(data = geo_labels,
+            aes(x = x, y = y, label = label),
+            color = "gray60", fontface = "italic", size = 3) +
+  geom_text(data = choke_labels,
+            aes(x = x, y = y, label = name),
+            color = "gray30", size = 2.5, fontface = "bold", vjust = -3.5) +
+
+  coord_equal() + theme_void() +
+  theme(
+    panel.background = element_rect(fill = "gray100", colour = "gray80"),
+    plot.title = element_text(size = 15),
+    plot.caption = element_text(size = 10),
+    legend.position = "right",
+    legend.box = "vertical"
+  ) +
+  labs(
+    title   = "Global Maritime Trade: Shipping routes, chokepoints and ports",
+    caption = "Data Sources: Benden, P. (2022), IMF PortWatch, and NOAA"
+  )
+```
+
+
+
+# 1.4 Rasterize maps of Global Maritime Trade
+
+## 1.4.1 Rasterize map of ports 
+
+
+```{r load-IMF-ports-data-2}
+
+# ── IMF PORTWATCH PORTS WITH ACTIVITY ──────────────────────────────
+
+ports_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_ports_database/FeatureServer/0/",
+  "query?where=1=1&outFields=*",
+  "&f=geojson"
+)
+
+# Load full dataset
+ports_raw <- sf::read_sf(ports_url)
+
+# Inspect available fields
+print(names(ports_raw))
+
+
+```
+
+
+
+```{r ports-clean}
+
+# Build dataframe keeping activity indicators
+ports_df <- data.frame(
+  lon     = ports_raw$lon,
+  lat     = ports_raw$lat,
+  name    = ports_raw$portname,
+  country = ports_raw$countrynoaccents,
+  vessels_total = ports_raw$vessel_count_total,      # count of vessels
+  share_export = ports_raw$share_country_maritime_export, # share of exports
+  share_import = ports_raw$share_country_maritime_import, # share of imports
+  portid = ports_raw$portid,             # if available
+  stringsAsFactors = FALSE
+)
+
+# Convert to Spilhaus projection
+ports_xy <- from_lonlat_to_spilhaus_xy(ports_df$lon, ports_df$lat)
+ports_df$x <- ports_xy[, 1]
+ports_df$y <- ports_xy[, 2]
+```
+
+
+```{r rasterizing-ports-map}
+library(terra)
+library(sf)
+
+# Convert ports_df to sf
+ports_sf <- st_as_sf(
+  ports_df,
+  coords = c("x", "y"),
+  crs = "ESRI:54099"
+)
+
+# Convert sf to terra vector
+ports_vect <- vect(ports_sf)
+
+# Create empty raster template based on ports extent
+r <- rast(ports_vect, res = 100000)  # 50 km grid (adjust as needed)
+
+# Rasterize by vessel counts
+ports_r_vessels <- rasterize(ports_vect, r, field = "vessels_total", fun = "sum")
+
+# Alternative: rasterize presence (1 if port exists in pixel)
+ports_r_presence <- rasterize(ports_vect, r, field = "portid", fun = function(x, ...) 1)
+
+# Plot
+plot(ports_r_vessels, main = "Rasterized Vessel Counts by Port (Spilhaus Projection)")
+```
+
+```{r rasterizing-ports-map-2}
+
+fields <- c("vessels_total", "share_export", "share_import")
+
+ports_rasters <- lapply(fields, function(f) {
+  rasterize(ports_vect, r, field = f, fun = "sum")
+})
+
+names(ports_rasters) <- fields
+ports_stack <- rast(ports_rasters)
+
+plot(ports_stack)
+```
+
+
+## 1.4.2 Rasterize map of choke points 
+
+```{r load-IMF-chokes-data-2}
+# ── IMF PORTWATCH CHOKEPOINTS WITH ACTIVITY ──────────────────────────────
+
+choke_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_chokepoints_database/FeatureServer/0/",
+  "query?where=1=1&outFields=*",
+  "&f=geojson"
+)
+
+# Load full dataset
+choke_raw <- sf::read_sf(choke_url)
+
+
+# Inspect fields
+print(names(choke_raw))
+
+```
+
+
+```{r ports-clean}
+
+# Build dataframe keeping activity indicators
+choke_df <- data.frame(
+  lon     = choke_raw$lon,
+  lat     = choke_raw$lat,
+  name    = choke_raw$portname,
+  country = choke_raw$countrynoaccents,
+  vessels_total = choke_raw$vessel_count_total,      # count of vessels
+  share_export = choke_raw$share_country_maritime_export, # share of exports
+  share_import = choke_raw$share_country_maritime_import, # share of imports
+  portid = choke_raw$portid,             # if available
+  stringsAsFactors = FALSE
+)
+
+# Convert to Spilhaus projection
+choke_xy <- from_lonlat_to_spilhaus_xy(choke_df$lon, choke_df$lat)
+choke_df$x <- choke_xy[, 1]
+choke_df$y <- choke_xy[, 2]
+```
+
+
+
+```{r rasterizing-ports-map}
+library(terra)
+library(sf)
+
+# Convert choke_df to sf
+choke_sf <- st_as_sf(
+  choke_df,
+  coords = c("x", "y"),
+  crs = "ESRI:54099"
+)
+
+# Convert sf to terra vector
+choke_vect <- vect(choke_sf)
+
+# Create empty raster template based on ports extent
+r <- rast(choke_vect, res = 100000)  # 50 km grid (adjust as needed)
+
+# Rasterize by vessel counts
+choke_r_vessels <- rasterize(choke_vect, r, field = "vessels_total", fun = "sum")
+
+# Alternative: rasterize presence (1 if port exists in pixel)
+choke_r_presence <- rasterize(choke_vect, r, field = "portid", fun = function(x, ...) 1)
+
+# Plot
+plot(choke_r_vessels, main = "Rasterized Vessel Counts by Chokepoint (Spilhaus Projection)")
+```
+
+## 1.4.3 Rasterize map of trade routes 
+
+     
+     
+```{r rasterizing-routes-map-6}
+
+library(dplyr)
+library(sf)
+library(terra)
+
+# ── 1. Rebuild sf LINESTRINGs robustly ─────────────
+shipping_lines <- shipping_coords_masked %>%
+  group_by(id, type) %>%
+  summarise(coords = list(unique(cbind(x, y))), .groups = "drop") %>%
+  # keep groups with at least 2 distinct coordinates (rows)
+  mutate(n_points = sapply(coords, nrow)) %>%
+  filter(n_points >= 2) %>%
+  mutate(
+    geometry = st_sfc(lapply(coords, st_linestring), crs = "ESRI:54099")
+  ) %>%
+  st_as_sf() %>%
+  select(-coords, -n_points)
+
+# ── 2. Convert to terra vector ─────────────
+shipping_vect <- vect(shipping_lines)
+
+# ── 3. Create raster template (~50km resolution) ─────────────
+r <- rast(shipping_vect, res = 100000)
+
+# ── 4. Rasterize presence vs weighted density ─────────────
+
+# Presence (count of routes crossing each cell)
+shipping_r_presence <- rasterize(
+  shipping_vect, r,
+  field = "id",
+  fun = "count"   # each route contributes 1 → presence
+)
+
+# Weighted density (sum of route weights)
+shipping_lines$weight <- recode(shipping_lines$type,
+                                "Major"  = 3,
+                                "Middle" = 2,
+                                "Minor"  = 1)
+
+shipping_vect <- vect(shipping_lines)
+
+shipping_r_weighted <- rasterize(
+  shipping_vect, r,
+  field = "weight",
+  fun = "sum"     # adds up weights by cell
+)
+
+
+# ── 5. Plot ─────────────
+plot(shipping_r_presence, main = "Rasterized Shipping Route Presence (Spilhaus Projection)")
+plot(shipping_r_weighted, main = "Rasterized Shipping Route Density (Weighted by Importance)")
+
+```
+
+
+
+
+```{r stack-trade-rasters}
+
+
+library(terra)
+
+# Pick a template grid (shipping routes here)
+template <- shipping_r_weighted
+
+# Reproject ports rasters
+ports_vessels_aligned  <- project(ports_r_vessels,  template)
+ports_presence_aligned <- project(ports_r_presence, template)
+
+# Reproject choke rasters
+choke_vessels_aligned  <- project(choke_r_vessels,  template)
+choke_presence_aligned <- project(choke_r_presence, template)
+
+# Shipping rasters already in template grid
+shipping_presence_aligned <- shipping_r_presence
+shipping_weighted_aligned <- shipping_r_weighted
+
+# Now stack them
+trade_stack <- rast(list(
+  ports_vessels     = ports_vessels_aligned,
+  ports_presence    = ports_presence_aligned,
+  choke_vessels     = choke_vessels_aligned,
+  choke_presence    = choke_presence_aligned,
+  shipping_presence = shipping_presence_aligned,
+  shipping_weighted = shipping_weighted_aligned
+))
+
+# Inspect stack
+print(trade_stack)
+plot(trade_stack)
+```
+
+
+# 2 Ocean Security: Ports, military bases and trade
+
+
+
+
+
+# 2.1 Port Country Group
+
+```{r map-ports-by-country-fill}
+
+# --- Define EU countries list ---
+eu_countries <- c(
+  "Austria", "Belgium", "Bulgaria", "Croatia", "Cyprus", "Czech Republic",
+  "Denmark", "Estonia", "Finland", "France", "Germany", "Greece", "Hungary",
+  "Ireland", "Italy", "Latvia", "Lithuania", "Luxembourg", "Malta",
+  "Netherlands", "Poland", "Portugal", "Romania", "Slovakia", "Slovenia",
+  "Spain", "Sweden"
+)
+
+# --- Assign port category ---
+ports_df <- ports_df %>%
+  mutate(port_group = case_when(
+    country == "United States" ~ "US",
+    country == "China" ~ "China",
+    country %in% eu_countries ~ "EU country",
+    TRUE ~ "Other"
+  ))
+
+# --- Map fill colors ---
+port_colors <- c(
+  "US" = "blue",
+  "China" = "red",
+  "EU country" = "lightgreen",
+  "Other" = "grey50"
+)
+
+# --- Plot ---
+ggplot() +
+  geom_tile(data = bkgr, aes(x, y), fill = "#dbefff") +
+  geom_tile(data = bkgr[bkgr$land == TRUE, ], aes(x, y), fill = "gray90") +
+  geom_point(data = coast, aes(x, y), colour = "#dbefff", size = 0.1, pch = ".") +
+
+  # Shipping routes
+  geom_path(
+    data = shipping_coords_masked,
+    aes(x = x, y = y, group = id, linewidth = type),
+    colour = "grey50", alpha = 0.2
+  ) +
+  scale_linewidth_manual(
+    name = "Type of shipping route",
+    values = c("Major" = 1.2, "Middle" = 0.7, "Minor" = 0.3)
+  ) +
+
+  # Chokepoints
+  geom_point(data = choke_df,
+             aes(x = x, y = y, size = vcnt),
+             shape = 21, fill = NA, colour = "orange",
+             alpha = 0.7, stroke = 1) +
+  scale_size_continuous(
+    name = "Annual vessel count",
+    range = c(1, 10)
+  ) +
+
+  # Ports with fill color by country group
+  ggnewscale::new_scale_fill() +
+  geom_point(data = ports_df,
+             aes(x = x, y = y, fill = port_group),
+             shape = 21, colour = "black", alpha = 0.3, size = 1.5, stroke = 0) +
+  scale_fill_manual(
+    name = "Port ownership",
+    values = port_colors
+  ) +
+
+  # Labels
+  geom_text(data = geo_labels,
+            aes(x = x, y = y, label = label),
+            color = "gray60", fontface = "italic", size = 3) +
+  geom_text(data = choke_labels,
+            aes(x = x, y = y, label = name),
+            color = "gray30", size = 2.5, fontface = "bold", vjust = -3.5) +
+
+  coord_equal() + theme_void() +
+  theme(
+    panel.background = element_rect(fill = "gray100", colour = "gray80"),
+    plot.title = element_text(size = 15),
+    plot.caption = element_text(size = 10),
+    legend.position = "right"
+  ) +
+  labs(
+    title   = "Ports by Country Group",
+    subtitle = "US (blue), China (red), EU (yellow), Others (grey)",
+    caption = "Data Sources: Benden, P. (2022), IMF PortWatch, and NOAA"
+  )
+```
+
+
+# 2.2 Overseas Military bases
+
+
+```{r load-overseas-military-bases}
+
+
+# Adjust the path to your unzipped shapefile directory
+shapefile_path <- "~/Desktop/Chinese_Overseas_Ports/20438805/Overseas Military Bases (Shapefile)"
+omb_sf <- st_read(shapefile_path)
+
+# Convert to Spilhaus projection
+omb_coords <- from_lonlat_to_spilhaus_xy(omb_sf$X, omb_sf$Y)
+omb_sf$x <- omb_coords[, 1]
+omb_sf$y <- omb_coords[, 2]
+```
+
+```{r map-ports-and-bases-by-country-fill-2}
+
+# --- Define EU countries list ---
+eu_countries <- c(
+  "Austria", "Belgium", "Bulgaria", "Croatia", "Cyprus", "Czech Republic",
+  "Denmark", "Estonia", "Finland", "France", "Germany", "Greece", "Hungary",
+  "Ireland", "Italy", "Latvia", "Lithuania", "Luxembourg", "Malta",
+  "Netherlands", "Poland", "Portugal", "Romania", "Slovakia", "Slovenia",
+  "Spain", "Sweden"
+)
+
+# --- Assign category to ports ---
+ports_df <- ports_df %>%
+  mutate(port_group = case_when(
+    country == "United States" ~ "US",
+    country == "China" ~ "China",
+    country %in% eu_countries ~ "EU country",
+    TRUE ~ "Other"
+  ))
+
+# --- Assign category to military bases ---
+omb_sf <- omb_sf %>%
+  mutate(base_group = case_when(
+    Operator == "United States" ~ "US",
+    Operator == "China" ~ "China",
+    Operator %in% eu_countries ~ "EU country",
+    TRUE ~ "Other"
+  ))
+
+# --- Color palette ---
+entity_colors <- c(
+  "US" = "blue",
+  "China" = "red",
+  "EU country" = "lightgreen",
+  "Other" = "grey50"
+)
+
+# --- Plot ---
+ggplot() +
+  geom_tile(data = bkgr, aes(x, y), fill = "#dbefff") +
+  geom_tile(data = bkgr[bkgr$land == TRUE, ], aes(x, y), fill = "gray90") +
+  geom_point(data = coast, aes(x, y), colour = "#dbefff", size = 0.1, pch = ".") +
+
+  # Shipping routes
+  geom_path(
+    data = shipping_coords_masked,
+    aes(x = x, y = y, group = id, linewidth = type),
+    colour = "grey50", alpha = 0.2
+  ) +
+  scale_linewidth_manual(
+    name = "Type of shipping route",
+    values = c("Major" = 1.2, "Middle" = 0.7, "Minor" = 0.3)
+  ) +
+
+  # Chokepoints
+  geom_point(data = choke_df,
+             aes(x = x, y = y, size = vcnt),
+             shape = 21, fill = NA, colour = "orange",
+             alpha = 0.7, stroke = 1) +
+  scale_size_continuous(
+    name = "Annual vessel count",
+    range = c(1, 10)
+  ) +
+
+  
+  # Ports
+ggnewscale::new_scale_fill() +
+geom_point(data = ports_df,
+           aes(x = x, y = y, fill = port_group),
+           shape = 21, colour = "black", alpha = 0.3, size = 1.5, stroke = 0) +
+scale_fill_manual(
+  name = "Port ownership",
+  values = entity_colors
+) +
+
+# Military bases
+ggnewscale::new_scale_fill() +  # <-- ADD THIS before the bases
+geom_point(data = omb_sf,
+           aes(x = x, y = y, fill = base_group),
+           shape = 23, colour = "black", size = 1.8, alpha = 0.6, stroke = 0.3) +
+scale_fill_manual(
+  name = "Military base ownership",
+  values = entity_colors
+) +
+  
+  # Labels
+  geom_text(data = geo_labels,
+            aes(x = x, y = y, label = label),
+            color = "gray60", fontface = "italic", size = 3) +
+  geom_text(data = choke_labels,
+            aes(x = x, y = y, label = name),
+            color = "gray30", size = 2.5, fontface = "bold", vjust = -3.5) +
+
+  coord_equal() + theme_void() +
+  theme(
+    panel.background = element_rect(fill = "gray100", colour = "gray80"),
+    plot.title = element_text(size = 15),
+    plot.caption = element_text(size = 10),
+    legend.position = "right"
+  ) +
+  labs(
+    title   = "Ports and Overseas Military Bases by Country Group",
+    subtitle = "US (blue), China (red), EU (light green), Others (grey)",
+    caption = "Data Sources: Benden, P. (2022), IMF PortWatch, and NOAA"
+  )
+```
+
+
+# 2.3 Chinese Dual-Use Overseas Ports
+
+
+```{r chinese-overseas-ports}
+# ── 4 · CHINESE OVERSEAS PORTS ─────────────────────────────────────
+
+# Load CSV
+ports_raw <- readr::read_csv(
+  "~/Desktop/Chinese_Overseas_Ports/data_share.csv",
+  show_col_types = FALSE
+)
+
+# Filter relevant ports
+ports <- subset(
+  ports_raw,
+  !is.na(lon) & !is.na(lat) &
+    dual_use_physical_potential %in% c("Yes", "Unclear", "No")
+)
+
+# Project to Spilhaus coordinates
+ports_xy <- from_lonlat_to_spilhaus_xy(ports$lon, ports$lat)
+
+# Create grid for binned display
+n_grid <- 150
+gx <- ceiling(n_grid * (ports_xy[, 1] - min(spil_grid$x)) / diff(range(spil_grid$x)))
+gy <- ceiling(n_grid * (ports_xy[, 2] - min(spil_grid$y)) / diff(range(spil_grid$y)))
+
+cells <- expand.grid(
+  x = seq(min(spil_grid$x), max(spil_grid$x), length.out = n_grid),
+  y = seq(min(spil_grid$y), max(spil_grid$y), length.out = n_grid)
+)
+cells$cat <- NA_character_
+
+# Priority for dual-use: No < Unclear < Yes
+rank_cat  <- c(No = 1, Unclear = 2, Yes = 3)
+
+for (i in seq_len(nrow(ports))) {
+  pos <- gx[i] + (gy[i] - 1) * n_grid
+  new <- ports$dual_use_physical_potential[i]
+  if (is.na(cells$cat[pos]) || rank_cat[new] > rank_cat[cells$cat[pos]]) {
+    cells$cat[pos] <- new
+  }
+}
+
+cells$z <- ifelse(is.na(cells$cat), 0, rank_cat[cells$cat])
+cells$cat <- factor(cells$cat, levels = c("No", "Unclear", "Yes"))
+
+# Keep only non-empty cells
+ports_plt <- subset(cells, z > 0)
+
+# Color mapping for dual-use potential
+du_cols <- c(Yes = "#cf142b", Unclear = "#f1c40f", No = "#107a30")
+```
+
+
+
+```{r map-dual-use-ports}
+ggplot() +
+  # Background
+  geom_tile(data = bkgr, aes(x, y), fill = "#dbefff") +
+  geom_tile(data = bkgr[bkgr$land == TRUE, ], aes(x, y), fill = "gray90") +
+  geom_point(data = coast, aes(x, y), colour = "gray70", size = 0.1, pch = ".") +
+
+  # Dual-use Chinese ports (binned grid)
+  geom_tile(data = ports_plt, aes(x, y, fill = cat)) +
+  scale_fill_manual(
+    name = "Dual-use port potential",
+    values = du_cols
+  ) +
+
+  # Overseas military bases (keeps your existing color code if desired)
+  geom_point(
+    data = omb_sf,
+    aes(x = x, y = y),
+    shape = 21, fill = "black", colour = "white", size = 2.2
+  ) +
+
+  coord_equal() + theme_void() +
+  theme(
+    panel.background = element_rect(fill = "lightgray", colour = "black"),
+    legend.box       = "vertical",
+    legend.spacing.y = unit(4, "pt"),
+    legend.title     = element_text(colour = "black"),
+    legend.text      = element_text(colour = "black"),
+    legend.position  = c(0.92, 0.83)
+  ) +
+  labs(
+    title = "Chinese Overseas Dual-use Ports & Overseas Military Bases",
+    subtitle = "Binned grid for port potential",
+    caption = "Data Sources: Benden, P. (2022), Chinese Overseas Ports Dataset"
+  )
+```
+
+
+
+
+
+```{r map-china-dualuse-bases-1, warning=FALSE}
+ggplot() +
+  # Background
+  geom_tile(data = bkgr, aes(x, y), fill = "#dbefff") +
+  geom_tile(data = bkgr[bkgr$land == TRUE, ], aes(x, y), fill = "gray90") +
+  geom_point(data = coast, aes(x, y), colour = "gray70", size = 0.1, pch = ".") +
+
+  # Chinese dual-use ports (only those with "Yes")
+  geom_point(
+    data = ports_plt %>% filter(cat == "Yes"),
+    aes(x = x, y = y),
+    shape = 21, fill = "red", colour = "black", size = 2
+  ) +
+
+  # Overseas military bases (all), highlight Chinese ones in red
+  geom_point(
+    data = omb_sf,
+    aes(x = x, y = y, fill = ifelse(Operator == "China", "China", "Other")),
+    shape = 23, colour = "black", size = 2
+  ) +
+  scale_fill_manual(
+    values = c("China" = "red", "Other" = "grey50"),
+    name = "Overseas military bases"
+  ) +
+
+  coord_equal() + theme_void() +
+  theme(
+    panel.background = element_rect(fill = "lightgray", colour = "black"),
+    legend.box       = "vertical",
+    legend.spacing.y = unit(4, "pt"),
+    legend.title     = element_text(colour = "black"),
+    legend.text      = element_text(colour = "black"),
+    legend.position  = c(0.9, 0.85)
+  ) +
+  labs(
+    title    = "Chinese Overseas Dual-use Ports & Overseas Military Bases",
+    subtitle = "Only Chinese dual-use ports (red) and all overseas bases",
+    caption  = "Data Sources: Benden, P. (2022), IMF PortWatch, Chinese Overseas Ports Dataset"
+  )
+```
+
+
+
+
+```{r merge-dualuse-and-bases, warning=FALSE, message=FALSE}
+
+ # --- 1. NATO countries as they appear in the dataset ---
+NATO_countries <- c("United States", "United Kingdoms", "France", "Italy")
+
+# --- 2. Chinese dual-use ports (only "Yes") ---
+china_dual_ports <- ports_plt %>%
+  filter(cat == "Yes") %>%
+  mutate(group = "China") %>%
+  select(x, y, group)
+
+# --- 3. Overseas military bases ---
+bases <- omb_sf %>%
+  mutate(group = ifelse(Operator == "China", "China",
+                        ifelse(Operator %in% NATO_countries, "NATO", "Other"))) %>%
+  select(x, y, group)
+
+# --- 4. Merge into a single dataset ---
+entities <- bind_rows(china_dual_ports, bases)
+
+# Quick check
+table(entities$group)
+```
+
+
+
+```{r voronoi-sf, warning=FALSE, message=FALSE}
+
+library(FNN)
+library(dplyr)
+library(ggplot2)
+library(ggnewscale)
+
+# --- 1. Restore land flag into bkgr ---
+bkgr <- pretify_spilhaus_df(spil_grid) %>%
+  left_join(
+    spil_grid %>% select(x, y, land),
+    by = c("x", "y")
+  )
+
+# --- 2. Keep only ocean cells ---
+ocean_cells <- bkgr %>% filter(!land)
+
+# --- 3. Combine Chinese dual-use ports + overseas military bases ---
+# Only "Yes" Chinese dual-use ports
+china_dual_ports <- ports_plt %>%
+  filter(cat == "Yes") %>%
+  mutate(group = "China") %>%
+  select(x, y, group)
+
+# NATO countries (subset of entities)
+NATO_countries <- c("United States", "United Kingdoms", "France", "Italy", "India,Japan")
+nato_bases <- omb_sf %>%
+  filter(Operator %in% NATO_countries) %>%
+  mutate(group = "NATO") %>%
+  select(x, y, group)
+
+# Other bases
+other_bases <- omb_sf %>%
+  filter(!(Operator %in% c(NATO_countries, "China"))) %>%
+  mutate(group = "Other") %>%
+  select(x, y, group)
+
+# Merge all
+entities_df <- bind_rows(china_dual_ports, nato_bases, other_bases)
+
+# --- 4. Nearest neighbor search ---
+nn <- get.knnx(
+  data  = entities_df[, c("x", "y")],
+  query = ocean_cells[, c("x", "y")],
+  k = 1
+)
+
+# Assign each ocean cell to nearest group
+ocean_cells$nearest_group <- entities_df$group[nn$nn.index]
+
+# --- 5. Define colors ---
+entity_colors <- c(
+  "China" = "red",
+  "NATO" = "blue",
+  "Other" = "grey50"
+)
+
+# --- 6. Plot ---
+ggplot() +
+  # Ocean painted by nearest base/port group
+  geom_tile(data = ocean_cells,
+            aes(x = x, y = y, fill = nearest_group),
+            alpha = 0.6) +
+  scale_fill_manual(
+    name = "Nearest entity",
+    values = entity_colors
+  ) +
+
+  # Land
+  geom_tile(data = bkgr %>% filter(land),
+            aes(x, y),
+            fill = "gray90") +
+
+  # Ports (circles)
+  geom_point(data = china_dual_ports,
+             aes(x = x, y = y),
+             shape = 21, fill = "red", colour = "black", size = 1.5) +
+
+  # Military bases (diamonds)
+  geom_point(data = bind_rows(nato_bases, other_bases),
+             aes(x = x, y = y, fill = group),
+             shape = 23, colour = "black", size = 2) +
+
+  coord_equal() + theme_void() +
+  labs(
+    title    = "Oceans Painted by Nearest Chinese or NATO Military Presence",
+    subtitle = "Red = China, Blue = NATO, Grey = Other",
+    caption  = "Data Sources: Benden, P. (2022), Chinese Overseas Ports Dataset, IMF PortWatch, NOAA"
+  ) +
+  theme(
+    legend.position = "right",
+    panel.background = element_rect(fill = "gray95", colour = NA)
+  )
+```
+
+
+
+
+## 2.4 Overseas Military Bases, Dual-Purpose ports and Commercial Ports.   
+
+
+```{r load-ports}
+
+# IMF Port Watch ports endpoint (GeoJSON)
+ports_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_ports_database/FeatureServer/0/",
+  "query?where=1=1&outFields=portid,portname,lat,lon,country&f=geojson"
+)
+
+ports_raw <- sf::read_sf(ports_url)
+
+# Prepare and project port coordinates
+ports_df <- data.frame(
+  lon     = ports_raw$lon,
+  lat     = ports_raw$lat,
+  name    = ports_raw$portname,
+  country = ports_raw$country,
+  stringsAsFactors = FALSE
+)
+ports_xy <- from_lonlat_to_spilhaus_xy(ports_df$lon, ports_df$lat)
+ports_df$x <- ports_xy[, 1]
+ports_df$y <- ports_xy[, 2]
+```
+
+
+
+
+
+
+
+
+
+
+
+```{r voronoi-sf, warning=FALSE, message=FALSE}
+
+library(FNN)
+library(dplyr)
+library(ggplot2)
+library(ggnewscale)
+
+# --- 1. Restore land flag into bkgr ---
+bkgr <- pretify_spilhaus_df(spil_grid) %>%
+  left_join(
+    spil_grid %>% select(x, y, land),
+    by = c("x", "y")
+  )
+
+# --- 2. Keep only ocean cells ---
+ocean_cells <- bkgr %>% filter(!land)
+
+# --- 3. Chinese dual-use ports (Yes only) ---
+china_dual_ports <- ports_plt %>%
+  filter(cat == "Yes") %>%
+  mutate(group = "China") %>%
+  select(x, y, group)
+
+# --- 4. Define NATO countries ---
+NATO_countries <- c("United States", "United Kingdoms", "France", "Italy")
+
+# --- 5. Overseas military bases ---
+nato_bases <- omb_sf %>%
+  filter(Operator %in% NATO_countries) %>%
+  mutate(group = "NATO") %>%
+  select(x, y, group)
+
+other_bases <- omb_sf %>%
+  filter(!(Operator %in% c(NATO_countries, "China"))) %>%
+  mutate(group = "Other") %>%
+  select(x, y, group)
+
+# --- 6. Filter IMF PortWatch ports ---
+# Include only ports from NATO countries or countries with overseas bases
+countries_with_bases <- unique(omb_sf$Operator)
+relevant_ports <- ports_df %>%
+  filter(country %in% c(NATO_countries, countries_with_bases)) %>%
+  mutate(group = case_when(
+    country == "China" ~ "China",
+    country %in% NATO_countries ~ "NATO",
+    TRUE ~ "Other"
+  )) %>%
+  select(x, y, group)
+
+# --- 7. Merge all entities ---
+entities_df <- bind_rows(china_dual_ports, nato_bases, other_bases, relevant_ports)
+
+# --- 8. Nearest neighbor search ---
+nn <- get.knnx(
+  data  = entities_df[, c("x", "y")],
+  query = ocean_cells[, c("x", "y")],
+  k = 1
+)
+
+# Assign each ocean cell to nearest group
+ocean_cells$nearest_group <- entities_df$group[nn$nn.index]
+
+# --- 9. Define colors ---
+entity_colors <- c(
+  "China" = "red",
+  "NATO" = "blue",
+  "Other" = "grey50"
+)
+
+# --- 10. Plot ---
+ggplot() +
+  # Ocean painted by nearest entity
+  geom_tile(data = ocean_cells,
+            aes(x = x, y = y, fill = nearest_group),
+            alpha = 0.6) +
+  scale_fill_manual(name = "Nearest entity", values = entity_colors) +
+
+  # Land
+  geom_tile(data = bkgr %>% filter(land),
+            aes(x, y),
+            fill = "gray90") +
+
+  # Ports (circles)
+  geom_point(data = bind_rows(china_dual_ports, relevant_ports),
+             aes(x = x, y = y, fill = group),
+             shape = 21, colour = "black", size = 1.5) +
+
+  # Military bases (diamonds)
+  geom_point(data = bind_rows(nato_bases, other_bases),
+             aes(x = x, y = y, fill = group),
+             shape = 23, colour = "black", size = 2) +
+
+  coord_equal() + theme_void() +
+  labs(
+    title    = "Oceans Painted by Nearest Military Base or Port",
+    subtitle = "Red = China, Blue = NATO, Grey = Other",
+    caption  = "Data Sources: Benden (2022), IMF PortWatch, NOAA, Chinese Overseas Ports Dataset"
+  ) +
+  theme(
+    legend.position = "right",
+    panel.background = element_rect(fill = "gray95", colour = NA)
+  )
+  
+```
+
+
+
+
+```{r voronoi-sf-smoothed-1.1, warning=FALSE, message=FALSE}
+library(FNN)
+library(dplyr)
+library(ggplot2)
+
+# --- 1. Restore land flag ---
+bkgr <- pretify_spilhaus_df(spil_grid) %>%
+  left_join(
+    spil_grid %>% select(x, y, land),
+    by = c("x", "y")
+  )
+
+# --- 2. Only ocean ---
+ocean_cells <- bkgr %>% filter(!land)
+
+# --- 3. Chinese dual-use ports ---
+china_dual_ports <- ports_plt %>%
+  filter(cat == "Yes") %>%
+  mutate(group = "China") %>%
+  select(x, y, group)
+
+# --- 4. NATO countries ---
+NATO_countries <- c("United States", "United Kingdom", "France", "Italy", "United Kingdoms")
+
+# --- 5. Military bases ---
+nato_bases <- omb_sf %>%
+  filter(Operator %in% NATO_countries) %>%
+  mutate(group = "NATO") %>%
+  select(x, y, group)
+
+other_bases <- omb_sf %>%
+  filter(!(Operator %in% c(NATO_countries, "China"))) %>%
+  mutate(group = "Other") %>%
+  select(x, y, group)
+
+# --- 6. Ports (filter only relevant ones) ---
+countries_with_bases <- unique(omb_sf$Operator)
+relevant_ports <- ports_df %>%
+  filter(country %in% c(NATO_countries, countries_with_bases)) %>%
+  mutate(group = case_when(
+    country == "China" ~ "China",
+    country %in% NATO_countries ~ "NATO",
+    TRUE ~ "Other"
+  )) %>%
+  select(x, y, group)
+
+# --- 7. Merge all entities ---
+entities_df <- bind_rows(china_dual_ports, nato_bases, other_bases, relevant_ports)
+
+# --- 8. K-nearest neighbors with weights ---
+k <- 20
+nn <- get.knnx(
+  data  = entities_df[, c("x", "y")],
+  query = ocean_cells[, c("x", "y")],
+  k = k
+)
+
+w <- 1 / (nn$nn.dist + 1e-6)   # avoid div by zero
+w <- w / rowSums(w)
+
+groups <- unique(entities_df$group)
+scores <- matrix(0, nrow = nrow(ocean_cells), ncol = length(groups))
+colnames(scores) <- groups
+
+# accumulate weighted scores
+for (i in seq_len(k)) {
+  g <- entities_df$group[nn$nn.index[, i]]
+  for (grp in groups) {
+    idx <- which(g == grp)
+    if (length(idx) > 0) {
+      scores[idx, grp] <- scores[idx, grp] + w[idx, i]
+    }
+  }
+}
+
+# assign group by max score
+ocean_cells$nearest_group <- groups[max.col(scores, ties.method = "first")]
+
+# --- 9. Colors ---
+entity_colors <- c("China" = "red", "NATO" = "blue", "Other" = "grey50")
+
+# --- 10. Plot ---
+ggplot() +
+  geom_tile(data = ocean_cells,
+            aes(x = x, y = y, fill = nearest_group),
+            alpha = 0.6) +
+  scale_fill_manual(values = entity_colors, name = "Nearest influence (smoothed)") +
+
+  geom_tile(data = bkgr %>% filter(land),
+            aes(x, y),
+            fill = "gray90") +
+
+  geom_point(data = bind_rows(china_dual_ports, relevant_ports),
+             aes(x = x, y = y, fill = group),
+             shape = 21, colour = "black", size = 1.5) +
+
+  geom_point(data = bind_rows(nato_bases, other_bases),
+             aes(x = x, y = y, fill = group),
+             shape = 23, colour = "black", size = 2) +
+
+  coord_equal() + theme_void() +
+  labs(
+    title    = "Oceans Painted by Influence of Nearest Ports/Bases",
+    subtitle = "Smoothed with inverse distance weighting, k=20",
+    caption  = "Data Sources: Benden (2022), IMF PortWatch, NOAA, Chinese Overseas Ports Dataset"
+  ) +
+  theme(
+    legend.position = "right",
+    panel.background = element_rect(fill = "gray95", colour = NA)
+  )
+```
+
+
+```{r voronoi-sf-smoothed-1.4, warning=FALSE, message=FALSE}
+
+# --- Influence map WITHOUT Chinese dual-use ports -----------------------------
+library(FNN)
+library(dplyr)
+library(ggplot2)
+
+# 1) Background & ocean cells
+bkgr <- pretify_spilhaus_df(spil_grid) %>%
+  left_join(spil_grid %>% select(x, y, land), by = c("x","y"))
+ocean_cells <- bkgr %>% filter(!land)
+
+# 2) Chinese dual-use ports (to EXCLUDE)
+#    ports_plt is your Chinese Overseas Ports dataset; cat=="Yes" marks dual-use
+china_dual_ports <- ports_plt %>%
+  filter(cat == "Yes") %>%
+  transmute(x, y, group = "China")
+
+# 3) NATO list (fix typo & duplicates)
+NATO_countries <- c("United States","United Kingdoms","France","Italy") %>% unique()
+
+# 4) Military bases → NATO / Other
+nato_bases <- omb_sf %>%
+  filter(Operator %in% NATO_countries) %>%
+  transmute(x, y, group = "NATO")
+
+other_bases <- omb_sf %>%
+  filter(!(Operator %in% c(NATO_countries, "China"))) %>%
+  transmute(x, y, group = "Other")
+
+# 5) Ports from IMF list, grouped → China / NATO / Other
+countries_with_bases <- unique(omb_sf$Operator)
+relevant_ports <- ports_df %>%
+  filter(country %in% c(NATO_countries, countries_with_bases, "China")) %>%
+  mutate(group = case_when(
+    country == "China" ~ "China",
+    country %in% NATO_countries ~ "NATO",
+    TRUE ~ "Other"
+  )) %>%
+  select(x, y, group)
+
+# 6) EXCLUDE Chinese dual-use ports from 'relevant_ports'
+#    Do a tolerant anti-join (Spilhaus is meters; use ~10 km tolerance via rounding)
+tol <- 10000
+duals_round <- china_dual_ports %>% mutate(xr = round(x/tol), yr = round(y/tol))
+ports_round <- relevant_ports   %>% mutate(xr = round(x/tol), yr = round(y/tol))
+relevant_ports_no_dual <- ports_round %>%
+  anti_join(duals_round %>% filter(group == "China"), by = c("xr","yr")) %>%
+  select(x, y, group)
+
+# 7) Entities for the NO-DUAL scenario
+entities_no_dual <- bind_rows(nato_bases, other_bases, relevant_ports_no_dual)
+
+# 8) KNN influence (robust)
+
+compute_influence <- function(entities, ocean, k = 20) {
+  stopifnot(nrow(entities) > 0)
+  k <- min(k, nrow(entities))
+
+  # Explicit coercion to plain numeric matrix
+  data_mat  <- as.matrix(data.frame(
+    x = as.numeric(entities$x),
+    y = as.numeric(entities$y)
+  ))
+  query_mat <- as.matrix(data.frame(
+    x = as.numeric(ocean$x),
+    y = as.numeric(ocean$y)
+  ))
+
+  nn <- FNN::get.knnx(data = data_mat, query = query_mat, k = k)
+
+  # inverse-distance weights
+  w <- 1 / (nn$nn.dist + 1e-6)
+  w <- w / rowSums(w)
+
+  # neighbor group labels
+  neigh_grp <- matrix(entities$group[nn$nn.index],
+                      nrow = nrow(query_mat), ncol = k)
+
+  groups <- intersect(c("China","NATO","Other"), unique(entities$group))
+
+  score_mat <- sapply(groups, function(g) rowSums(w * (neigh_grp == g)))
+  colnames(score_mat) <- groups
+
+  ocean$nearest_group <- groups[max.col(score_mat, ties.method = "first")]
+  ocean
+}
+
+ocean_no_dual <- compute_influence(entities_no_dual, ocean_cells, k = 20)
+
+# 9) Plot (NO-DUAL scenario)
+entity_colors <- c("China" = "red", "NATO" = "blue", "Other" = "grey50")
+
+ggplot() +
+  geom_tile(data = ocean_no_dual, aes(x, y, fill = nearest_group), alpha = 0.6) +
+  scale_fill_manual(values = entity_colors, name = "Nearest influence (smoothed)") +
+  geom_tile(data = bkgr %>% filter(land), aes(x, y), fill = "gray90") +
+  # show non-dual ports + bases
+  geom_point(data = relevant_ports_no_dual, aes(x, y, fill = group),
+             shape = 21, colour = "black", size = 1.3) +
+  geom_point(data = bind_rows(nato_bases, other_bases), aes(x, y, fill = group),
+             shape = 23, colour = "black", size = 1.8) +
+  coord_equal() + theme_void() +
+  labs(
+    title    = "Oceans Painted by Influence (Chinese Dual-Use Ports EXCLUDED)",
+    subtitle = "Inverse-distance KNN, k = 20",
+    caption  = "Data: Benden (2022), IMF PortWatch, NOAA, Chinese Overseas Ports"
+  ) +
+  theme(legend.position = "right",
+        panel.background = element_rect(fill = "gray95", colour = NA))
+
+```
+
+
+```{r voronoi-sf-smoothed-1.4.1-side-by-side, warning=FALSE, message=FALSE}
+
+library(FNN)
+library(dplyr)
+library(ggplot2)
+library(patchwork)  # for side-by-side plots
+
+# ---------------- Function (numeric-safe) ----------------
+compute_influence <- function(entities, ocean, k = 20) {
+  stopifnot(nrow(entities) > 0)
+  k <- min(k, nrow(entities))
+
+  data_mat  <- as.matrix(data.frame(
+    x = as.numeric(entities$x),
+    y = as.numeric(entities$y)
+  ))
+  query_mat <- as.matrix(data.frame(
+    x = as.numeric(ocean$x),
+    y = as.numeric(ocean$y)
+  ))
+
+  nn <- FNN::get.knnx(data = data_mat, query = query_mat, k = k)
+
+  w <- 1 / (nn$nn.dist + 1e-6)
+  w <- w / rowSums(w)
+
+  neigh_grp <- matrix(entities$group[nn$nn.index],
+                      nrow = nrow(query_mat), ncol = k)
+
+  groups <- intersect(c("China","NATO","Other"), unique(entities$group))
+
+  score_mat <- sapply(groups, function(g) rowSums(w * (neigh_grp == g)))
+  colnames(score_mat) <- groups
+
+  ocean$nearest_group <- groups[max.col(score_mat, ties.method = "first")]
+  ocean
+}
+
+# ---------------- Entities WITH and WITHOUT ----------------
+entities_with_dual <- bind_rows(china_dual_ports, nato_bases, other_bases, relevant_ports)
+entities_no_dual   <- bind_rows(nato_bases, other_bases, relevant_ports_no_dual)
+
+# ---------------- Influence maps ----------------
+ocean_with_dual <- compute_influence(entities_with_dual, ocean_cells, k = 20)
+ocean_no_dual   <- compute_influence(entities_no_dual,   ocean_cells, k = 20)
+
+# ---------------- Plotting ----------------
+entity_colors <- c("China" = "#cd071e", "NATO" = "#118ACB", "Other" = "grey70")
+
+p_with <- ggplot() +
+  geom_tile(data = ocean_with_dual, aes(x, y, fill = nearest_group), alpha = 0.6) +
+  scale_fill_manual(values = entity_colors) +
+  geom_tile(data = bkgr %>% filter(land), aes(x, y), fill = "gray90") +
+  geom_point(data = entities_with_dual, aes(x, y, fill = group),
+             shape = 21, colour = "gray0", size = 1) +
+  coord_equal() + theme_void() +
+  labs(title = "Reach with Dual-Use Ports")
+
+p_no <- ggplot() +
+  geom_tile(data = ocean_no_dual, aes(x, y, fill = nearest_group), alpha = 0.6) +
+  scale_fill_manual(values = entity_colors) +
+  geom_tile(data = bkgr %>% filter(land), aes(x, y), fill = "gray90") +
+  geom_point(data = entities_no_dual, aes(x, y, fill = group),
+             shape = 21, colour = "gray0", size = 1) +
+  coord_equal() + theme_void() +
+  labs(title = "Reach without Dual-Use Ports")
+
+# ---------------- Side-by-side ----------------
+p_no + p_with + 
+  plot_annotation(
+    title = "Impact of Chinese Dual-Use Ports on Maritime Influence",
+    subtitle = "Comparison of nearest-influence zones (IDW, k=20)"
+  )
+  
+  
+```
+
+
+```{r voronoi-sf-smoothed-1.4.1.1-side-by-side, warning=FALSE, message=FALSE}
+
+p_with <- ggplot() +
+  geom_tile(data = ocean_with_dual, aes(x, y, fill = nearest_group), alpha = 0.6) +
+  scale_fill_manual(values = entity_colors, name = NULL) +
+  geom_tile(data = bkgr %>% filter(land), aes(x, y), fill = "gray90") +
+  geom_point(data = entities_with_dual, aes(x, y, fill = group),
+             shape = 21, colour = "gray0", size = 1) +
+  coord_equal() + theme_void() +
+  labs(title = "Reach with Dual-Use Ports") +
+  guides(fill = guide_legend(title = NULL))
+
+p_no <- ggplot() +
+  geom_tile(data = ocean_no_dual, aes(x, y, fill = nearest_group), alpha = 0.6) +
+  scale_fill_manual(values = entity_colors, name = NULL) +
+  geom_tile(data = bkgr %>% filter(land), aes(x, y), fill = "gray90") +
+  geom_point(data = entities_no_dual, aes(x, y, fill = group),
+             shape = 21, colour = "gray0", size = 1) +
+  coord_equal() + theme_void() +
+  labs(title = "Reach without Dual-Use Ports") +
+  guides(fill = guide_legend(title = NULL))
+
+# ---------------- Side-by-side with shared legend ----------------
+p_no + p_with +
+  plot_annotation(
+    title = "Impact of Chinese Dual-Use Ports on Maritime Influence",
+    subtitle = "Comparison of nearest-influence zones (IDW, k=20)"
+  ) &
+  theme(legend.position = "right") +   # move legend if you want
+  plot_layout(guides = "collect")
+```
+
+  
+```{r voronoi-sf-smoothed-1.4.2-side-by-side, warning=FALSE, message=FALSE}
+
+
+# ---------------- Difference map ----------------
+# mark cells where China gains influence due to dual-use ports
+diff_df <- ocean_with_dual %>%
+  select(x, y, nearest_group) %>%
+  rename(group_with = nearest_group) %>%
+  bind_cols(ocean_no_dual %>% select(nearest_group) %>% rename(group_no = nearest_group)) %>%
+  mutate(change = case_when(
+    group_no != "China" & group_with == "China" ~ "Gained by China",
+    group_no == "China" & group_with != "China" ~ "Lost by China", # unlikely but possible
+    TRUE ~ "No change"
+  ))
+
+p_diff <- ggplot() +
+  geom_tile(data = diff_df, aes(x, y, fill = change), alpha = 0.7) +
+  scale_fill_manual(values = c(
+    "Gained by China" = "darkorange",
+    "Lost by China"  = "gray80",
+    "No change"      = "grey90"
+  )) +
+  geom_tile(data = bkgr %>% filter(land), aes(x, y), fill = "gray70") +
+  coord_equal() + theme_void() +
+  labs(title = "Difference Map: Added Reach from Dual-Use Ports")
+
+# ---------------- Side-by-side (3 maps) ----------------
+(p_no | p_with | p_diff) +
+  plot_annotation(
+    title = "Impact of Chinese Dual-Use Ports on Maritime Influence",
+    subtitle = "Inverse Distance Weighted KNN (k=20)"
+  )
+```
+
+
+
+
+# 3.1 Voronoi tessellation
+
+
+
+```{r ocean-colored-by-country-group}
+
+library(FNN)
+library(dplyr)
+library(ggplot2)
+library(ggnewscale)
+
+# --- 1. Restore land flag into bkgr ---
+bkgr <- pretify_spilhaus_df(spil_grid) %>%
+  left_join(
+    spil_grid %>% select(x, y, land),
+    by = c("x", "y")
+  )
+
+# --- 2. Keep only ocean cells ---
+ocean_cells <- bkgr %>% filter(!land)
+
+# --- 3. Chinese dual-use ports (Yes only) ---
+china_dual_ports <- ports_plt %>%
+  filter(cat == "Yes") %>%
+  mutate(group = "China") %>%
+  select(x, y, group)
+
+# --- 4. Define NATO countries ---
+NATO_countries <- c("United States", "United Kingdoms", "France", "Italy")
+
+# --- 5. Overseas military bases ---
+nato_bases <- omb_sf %>%
+  filter(Operator %in% NATO_countries) %>%
+  mutate(group = "NATO") %>%
+  select(x, y, group)
+
+other_bases <- omb_sf %>%
+  filter(!(Operator %in% c(NATO_countries, "China"))) %>%
+  mutate(group = "Other") %>%
+  select(x, y, group)
+
+# --- 6. Filter IMF PortWatch ports ---
+# Include only ports from NATO countries or countries with overseas bases
+countries_with_bases <- unique(omb_sf$Operator)
+relevant_ports <- ports_df %>%
+  filter(country %in% c(NATO_countries, countries_with_bases)) %>%
+  mutate(group = case_when(
+    country == "China" ~ "China",
+    country %in% NATO_countries ~ "NATO",
+    TRUE ~ "Other"
+  )) %>%
+  select(x, y, group)
+
+# --- 7. Merge all entities ---
+entities_df <- bind_rows(china_dual_ports, nato_bases, other_bases, relevant_ports)
+
+# --- 8. Nearest neighbor search ---
+nn <- get.knnx(
+  data  = entities_df[, c("x", "y")],
+  query = ocean_cells[, c("x", "y")],
+  k = 1
+)
+
+# Assign each ocean cell to nearest group
+ocean_cells$nearest_group <- entities_df$group[nn$nn.index]
+
+# --- 9. Define colors ---
+entity_colors <- c(
+  "China" = "red",
+  "NATO" = "blue",
+  "Other" = "grey50"
+)
+
+# --- 10. Plot ---
+ggplot() +
+  # Ocean painted by nearest entity
+  geom_tile(data = ocean_cells,
+            aes(x = x, y = y, fill = nearest_group),
+            alpha = 0.6) +
+  scale_fill_manual(name = "Nearest entity", values = entity_colors) +
+
+  # Land
+  geom_tile(data = bkgr %>% filter(land),
+            aes(x, y),
+            fill = "gray90") +
+
+  # Ports (circles)
+  geom_point(data = bind_rows(china_dual_ports, relevant_ports),
+             aes(x = x, y = y, fill = group),
+             shape = 21, colour = "black", size = 1.5) +
+
+  # Military bases (diamonds)
+  geom_point(data = bind_rows(nato_bases, other_bases),
+             aes(x = x, y = y, fill = group),
+             shape = 23, colour = "black", size = 2) +
+
+  coord_equal() + theme_void() +
+  labs(
+    title    = "Oceans Painted by Nearest Military Base or Port",
+    subtitle = "Red = China, Blue = NATO, Grey = Other",
+    caption  = "Data Sources: Benden (2022), IMF PortWatch, NOAA, Chinese Overseas Ports Dataset"
+  ) +
+  theme(
+    legend.position = "right",
+    panel.background = element_rect(fill = "gray95", colour = NA)
+  )
+```
+
+
+```{r ocean-colored-by-country-group-2}
+
+library(FNN)   # for fast nearest neighbor search
+library(dplyr)
+library(ggplot2)
+
+# --- 1. Restore land flag into bkgr properly ---
+bkgr <- pretify_spilhaus_df(spil_grid) %>%
+  left_join(
+    spil_grid %>% dplyr::select(x, y, land),
+    by = c("x", "y")
+  )
+
+# --- 2. Keep only ocean cells ---
+ocean_cells <- bkgr %>% filter(!land)
+
+# --- 3. Combine ports + bases into entities dataset ---
+entities_df <- ports_df %>%
+  select(x, y, group = port_group) %>%
+  bind_rows(
+    omb_sf %>% select(x, y, group = base_group)
+  )
+
+# --- 4. Nearest neighbor: assign each ocean cell to nearest entity ---
+nn <- FNN::get.knnx(
+  data  = entities_df[, c("x", "y")],
+  query = ocean_cells[, c("x", "y")],
+  k = 1
+)
+
+ocean_cells$nearest_group <- entities_df$group[nn$nn.index]
+
+# --- 5. Define consistent colors ---
+entity_colors <- c(
+  "US" = "blue",
+  "China" = "red",
+  "EU country" = "lightgreen",
+  "Other" = "grey50"
+)
+
+# --- 6. Plot ocean painted by nearest port/base group ---
+ggplot() +
+  # Ocean cells colored by group
+  geom_tile(data = ocean_cells,
+            aes(x = x, y = y, fill = nearest_group),
+            alpha = 0.6) +
+  scale_fill_manual(
+    name   = "Nearest entity",
+    values = entity_colors
+  ) +
+
+  # Land
+  geom_tile(data = bkgr %>% filter(land),
+            aes(x, y),
+            fill = "gray90") +
+
+  # Shipping routes
+  geom_path(
+    data = shipping_coords_masked,
+    aes(x = x, y = y, group = id, linewidth = type),
+    colour = "black", alpha = 0.15
+  ) +
+  scale_linewidth_manual(
+    name   = "Type of shipping route",
+    values = c("Major" = 1.2, "Middle" = 0.7, "Minor" = 0.3)
+  ) +
+
+  # Ports (outlined)
+  geom_point(data = ports_df,
+             aes(x = x, y = y, fill = port_group),
+             shape = 21, size = 1.5, colour = "black") +
+
+  # Bases (diamonds)
+  geom_point(data = omb_sf,
+             aes(x = x, y = y, fill = base_group),
+             shape = 23, size = 2, colour = "black") +
+
+  coord_equal() + theme_void() +
+  labs(
+    title   = "Ocean Painted by Nearest Port or Base Ownership Group",
+    subtitle = "US (blue), China (red), EU (light green), Others (grey)",
+    caption = "Data Sources: Benden, P. (2022), IMF PortWatch, NOAA, Chinese Overseas Ports"
+  ) +
+  theme(
+    legend.position = "right",
+    panel.background = element_rect(fill = "gray95", colour = NA)
+  )
+```
+
+
+
+
+
+
+```{r ocean-colored-by-country-group-3}
+
+library(FNN)
+
+# --- Combine ports and bases into one "entities" dataset ---
+entities_df <- ports_df %>%
+  select(x, y, group = port_group) %>%
+  bind_rows(
+    omb_sf %>% select(x, y, group = base_group)
+  )
+
+# --- Only keep ocean cells ---
+ocean_cells <- bkgr %>% filter(land == FALSE)
+
+# --- k-nearest neighbors with inverse distance weighting ---
+k <- 10  # number of neighbors to use
+nn <- FNN::get.knnx(
+  data  = entities_df[, c("x", "y")],
+  query = ocean_cells[, c("x", "y")],
+  k = k
+)
+
+# Compute weights = 1 / distance
+w <- 1 / (nn$nn.dist + 1e-6)   # avoid div by zero
+w <- w / rowSums(w)
+
+# Prepare score matrix for groups
+groups <- unique(entities_df$group)
+scores <- matrix(0, nrow = nrow(ocean_cells), ncol = length(groups))
+colnames(scores) <- groups
+
+# Accumulate weighted influence
+for (i in seq_len(k)) {
+  g <- entities_df$group[nn$nn.index[, i]]
+  for (grp in groups) {
+    idx <- which(g == grp)
+    if (length(idx) > 0) {
+      scores[idx, grp] <- scores[idx, grp] + w[idx, i]
+    }
+  }
+}
+
+# Assign group with max weighted score
+ocean_cells$nearest_group <- groups[max.col(scores, ties.method = "first")]
+
+# --- Plot with smoother transitions ---
+ggplot() +
+  geom_tile(data = ocean_cells, aes(x, y, fill = nearest_group), alpha = 0.6) +
+  scale_fill_manual(values = entity_colors, name = "Nearest entity (smoothed)") +
+
+  # Shipping routes
+  geom_path(
+    data = shipping_coords_masked,
+    aes(x = x, y = y, group = id, linewidth = type),
+    colour = "black", alpha = 0.3
+  ) +
+  scale_linewidth_manual(
+    values = c("Major" = 1.0, "Middle" = 0.6, "Minor" = 0.3),
+    name = "Type of shipping route"
+  ) +
+
+  coord_equal() + theme_void() +
+  labs(
+    title = "Ocean Painted by Nearest Port/Base (Smoothed)",
+    subtitle = "US (blue), China (red), EU (light green), Others (grey)"
+  )
+```
+
+
+
+
+```{r ocean-colored-by-country-group-4.1}
+
+# --- Define EU and NATO (non-EU) country lists ---
+eu_countries <- c(
+  "Austria","Belgium","Bulgaria","Croatia","Cyprus","Czech Republic",
+  "Denmark","Estonia","Finland","France","Germany","Greece","Hungary",
+  "Ireland","Italy","Latvia","Lithuania","Luxembourg","Malta",
+  "Netherlands","Poland","Portugal","Romania","Slovakia","Slovenia",
+  "Spain","Sweden"
+)
+
+nato_non_eu <- c(
+  "United Kingdom", "Norway", "Turkey", "Canada",
+  "United States", "Iceland", "Albania", "Montenegro",
+  "North Macedonia"
+)
+
+# --- Assign categories to ports ---
+ports_df <- ports_df %>%
+  mutate(port_group = case_when(
+    country == "United States" ~ "US",
+    country == "China" ~ "China",
+    country %in% eu_countries ~ "EU country",
+    country %in% nato_non_eu ~ "NATO (non-EU)",
+    TRUE ~ "Other"
+  ))
+
+# --- Assign categories to military bases ---
+omb_sf <- omb_sf %>%
+  mutate(base_group = case_when(
+    Operator == "United States" ~ "US",
+    Operator == "China" ~ "China",
+    Operator %in% eu_countries ~ "EU country",
+    Operator %in% nato_non_eu ~ "NATO (non-EU)",
+    TRUE ~ "Other"
+  ))
+
+# --- Update color palette ---
+entity_colors <- c(
+  "US" = "blue",
+  "China" = "red",
+  "EU country" = "lightgreen",
+  "NATO (non-EU)" = "lightblue",
+  "Other" = "grey50"
+)
+```
+
+# --- (rest of your smoothing + plotting stays the same) ---
+
+
+```{r ocean-colored-by-country-group-4.2}
+
+
+# --- Combine ports and bases into one "entities" dataset ---
+entities_df <- ports_df %>%
+  select(x, y, group = port_group) %>%
+  bind_rows(
+    omb_sf %>% select(x, y, group = base_group)
+  )
+
+# --- Only keep ocean cells ---
+ocean_cells <- bkgr %>% filter(land == FALSE)
+
+# --- k-nearest neighbors with inverse distance weighting ---
+k <- 30  # number of neighbors to use
+nn <- FNN::get.knnx(
+  data  = entities_df[, c("x", "y")],
+  query = ocean_cells[, c("x", "y")],
+  k = k
+)
+
+# Compute weights = 1 / distance
+w <- 1 / (nn$nn.dist + 1e-6)   # avoid div by zero
+w <- w / rowSums(w)
+
+# Prepare score matrix for groups
+groups <- unique(entities_df$group)
+scores <- matrix(0, nrow = nrow(ocean_cells), ncol = length(groups))
+colnames(scores) <- groups
+
+# Accumulate weighted influence
+for (i in seq_len(k)) {
+  g <- entities_df$group[nn$nn.index[, i]]
+  for (grp in groups) {
+    idx <- which(g == grp)
+    if (length(idx) > 0) {
+      scores[idx, grp] <- scores[idx, grp] + w[idx, i]
+    }
+  }
+}
+
+# Assign group with max weighted score
+ocean_cells$nearest_group <- groups[max.col(scores, ties.method = "first")]
+
+# --- Plot with smoother transitions ---
+ggplot() +
+  geom_tile(data = ocean_cells, aes(x, y, fill = nearest_group), alpha = 0.6) +
+  scale_fill_manual(values = entity_colors, name = "Nearest entity (smoothed)") +
+
+  # Shipping routes
+  geom_path(
+    data = shipping_coords_masked,
+    aes(x = x, y = y, group = id, linewidth = type),
+    colour = "black", alpha = 0.3
+  ) +
+  scale_linewidth_manual(
+    values = c("Major" = 1.0, "Middle" = 0.6, "Minor" = 0.3),
+    name = "Type of shipping route"
+  ) +
+
+  coord_equal() + theme_void() +
+  labs(
+    title = "Ocean Painted by Nearest Port/Base (Smoothed)",
+    subtitle = "US (blue), China (red), EU (light green), Others (grey)"
+  )
+```
+
+
+
+```{r voronoi-sf-smoothed-1.1, warning=FALSE, message=FALSE}
+library(FNN)
+library(dplyr)
+library(ggplot2)
+
+# --- 1. Restore land flag ---
+bkgr <- pretify_spilhaus_df(spil_grid) %>%
+  left_join(
+    spil_grid %>% select(x, y, land),
+    by = c("x", "y")
+  )
+
+# --- 2. Only ocean ---
+ocean_cells <- bkgr %>% filter(!land)
+
+# --- 3. Chinese dual-use ports ---
+china_dual_ports <- ports_plt %>%
+  filter(cat == "Yes") %>%
+  mutate(group = "China") %>%
+  select(x, y, group)
+
+# --- 4. NATO countries ---
+NATO_countries <- c("United States", "United Kingdom", "France", "Italy", "United Kingdoms")
+
+# --- 5. Military bases ---
+nato_bases <- omb_sf %>%
+  filter(Operator %in% NATO_countries) %>%
+  mutate(group = "NATO") %>%
+  select(x, y, group)
+
+other_bases <- omb_sf %>%
+  filter(!(Operator %in% c(NATO_countries, "China"))) %>%
+  mutate(group = "Other") %>%
+  select(x, y, group)
+
+# --- 6. Ports (filter only relevant ones) ---
+countries_with_bases <- unique(omb_sf$Operator)
+relevant_ports <- ports_df %>%
+  filter(country %in% c(NATO_countries, countries_with_bases)) %>%
+  mutate(group = case_when(
+    country == "China" ~ "China",
+    country %in% NATO_countries ~ "NATO",
+    TRUE ~ "Other"
+  )) %>%
+  select(x, y, group)
+
+# --- 7. Merge all entities ---
+entities_df <- bind_rows(china_dual_ports, nato_bases, other_bases, relevant_ports)
+
+# --- 8. K-nearest neighbors with weights ---
+k <- 20
+nn <- get.knnx(
+  data  = entities_df[, c("x", "y")],
+  query = ocean_cells[, c("x", "y")],
+  k = k
+)
+
+w <- 1 / (nn$nn.dist + 1e-6)   # avoid div by zero
+w <- w / rowSums(w)
+
+groups <- unique(entities_df$group)
+scores <- matrix(0, nrow = nrow(ocean_cells), ncol = length(groups))
+colnames(scores) <- groups
+
+# accumulate weighted scores
+for (i in seq_len(k)) {
+  g <- entities_df$group[nn$nn.index[, i]]
+  for (grp in groups) {
+    idx <- which(g == grp)
+    if (length(idx) > 0) {
+      scores[idx, grp] <- scores[idx, grp] + w[idx, i]
+    }
+  }
+}
+
+# assign group by max score
+ocean_cells$nearest_group <- groups[max.col(scores, ties.method = "first")]
+
+# --- 9. Colors ---
+entity_colors <- c("China" = "#cd071e", "NATO" = "#118ACB", "Other" = "grey50")
+
+# --- 10. Plot ---
+ggplot() +
+  geom_tile(data = ocean_cells,
+            aes(x = x, y = y, fill = nearest_group),
+            alpha = 0.6) +
+  scale_fill_manual(values = entity_colors, name = "Nearest influence (smoothed)") +
+
+  geom_tile(data = bkgr %>% filter(land),
+            aes(x, y),
+            fill = "gray90") +
+
+  geom_point(data = bind_rows(china_dual_ports, relevant_ports),
+             aes(x = x, y = y, fill = group),
+             shape = 21, colour = "black", size = 1.5) +
+
+  geom_point(data = bind_rows(nato_bases, other_bases),
+             aes(x = x, y = y, fill = group),
+             shape = 23, colour = "black", size = 2) +
+  # Shipping routes
+  geom_path(
+    data = shipping_coords_masked,
+    aes(x = x, y = y, group = id, linewidth = type),
+    colour = "black", alpha = 0.3
+  ) +
+  scale_linewidth_manual(
+    values = c("Major" = 1.0, "Middle" = 0.6, "Minor" = 0.3),
+    name = "Type of shipping route"
+  ) +
+  coord_equal() + theme_void() +
+  labs(
+    title    = "Oceans Painted by Influence of Nearest Ports/Bases",
+    subtitle = "Smoothed with inverse distance weighting, k=20",
+    caption  = "Data Sources: Benden (2022), IMF PortWatch, NOAA, Chinese Overseas Ports Dataset"
+  ) +
+  theme(
+    legend.position = "right",
+    panel.background = element_rect(fill = "gray95", colour = NA)
+  )
+```
+

@@ -1,0 +1,407 @@
+---
+title: "Spilhaus Projections on Trade and Security"
+author: "Javier Ospital"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+
+```{r setup}
+rm(list = ls())
+
+libs <- c("sf", "dplyr", "ggplot2", "purrr", "rerddap", "ncdf4", "units")
+invisible(lapply(setdiff(libs, installed.packages()[, "Package"]), install.packages))
+invisible(lapply(libs, library, character.only = TRUE))
+
+source("~/Downloads/spilhaus.R")
+```
+
+```{r land-mask-functions}
+download_land_mask <- function() {
+  info <- rerddap::info("NOAA_DHW_monthly", url = "https://coastwatch.pfeg.noaa.gov/erddap/")
+  dat  <- rerddap::griddap(info, fields = "mask",
+                           latitude  = c(-89.975, 89.975),
+                           longitude = c(-179.975, 179.975),
+                           time = c("2024-01-01", "2024-01-01"))
+  ncdf4::nc_open(dat$summary$filename)
+}
+extract_mask <- function(da, lonlat) {
+  lons <- sort(ncdf4::ncvar_get(da, "longitude"))
+  lats <- sort(ncdf4::ncvar_get(da, "latitude"))
+  idx  <- function(vec, pos) as.integer(round((pos - vec[1]) / (vec[2] - vec[1])) + 1)
+  ln   <- idx(lons, lonlat[, 1])
+  la   <- idx(lats, lonlat[, 2])
+  msk  <- ncdf4::ncvar_get(da, "mask", start = c(1, 1, 1), count = c(7200, 3600, 1))
+  msk  <- msk[, ncol(msk):1]
+  out  <- msk[ln + (la - 1) * nrow(msk)]
+  out[out == 1] <- NA
+  out[out == 4] <- 0
+  out
+}
+```
+
+```{r background}
+grid_res  <- 1000
+spil_grid <- make_spilhaus_xy_gridpoints(grid_res)
+lonlat    <- from_spilhaus_xy_to_lonlat(spil_grid$x, spil_grid$y)
+da <- download_land_mask()
+spil_grid$z    <- extract_mask(da, lonlat)
+spil_grid$land <- is.na(spil_grid$z)
+coast_df       <- make_spilhaus_xy_gridpoints(grid_res)
+coast_df$z     <- extract_mask(da, lonlat)
+coast_df$land  <- is.na(coast_df$z)
+bkgr  <- pretify_spilhaus_df(spil_grid)
+coast <- pretify_spilhaus_df(coast_df)
+```
+# 1.1 Shipping 
+```{r load-shipping}
+shipping_file <- "/Users/javieroctavioospitalgreslebin/Desktop/Chinese_Overseas_Ports/newzealandpaul/newzealandpaul-Shipping-Lanes-b0ad85c/data/Shipping-Lanes-v1/Shipping-Lanes-v1.shp"
+shipping_sf   <- st_read(shipping_file, quiet = TRUE)
+shipping_sf   <- st_make_valid(shipping_sf)
+shipping_sf   <- st_segmentize(shipping_sf, set_units(0.1, "degrees"))
+st_geometry(shipping_sf) <- st_wrap_dateline(
+  st_geometry(shipping_sf),
+  options = c("WRAPDATELINE=YES", "DATELINEOFFSET=180")
+)
+```
+
+
+```{r transform-and-segment}
+# Ensure lon/lat are present!
+shipping_coords_raw <- purrr::map_dfr(seq_len(nrow(shipping_sf)), function(i) {
+  multiline <- st_geometry(shipping_sf)[[i]]
+  purrr::map_dfr(seq_along(multiline), function(j) {
+    coords <- multiline[[j]]
+    coords[, 1] <- ifelse(coords[, 1] > 180, coords[, 1] - 360, coords[, 1])
+    coords[, 1] <- ifelse(coords[, 1] < -180, coords[, 1] + 360, coords[, 1])
+    xy <- from_lonlat_to_spilhaus_xy(coords[, 1], coords[, 2])
+    data.frame(
+      x = xy[, 1], y = xy[, 2],
+      lon = coords[, 1], lat = coords[, 2], # <-- These columns are needed!
+      original_id = paste0(i, "_", j),
+      seq_index = seq_along(xy[, 1])
+    )
+  })
+})
+
+shipping_coords_segmented <- shipping_coords_raw %>%
+  group_by(original_id) %>%
+  mutate(
+    dist_to_next = sqrt((x - lead(x))^2 + (y - lead(y))^2)
+  ) %>%
+  ungroup()
+
+jump_thresh <- quantile(shipping_coords_segmented$dist_to_next, 0.999, na.rm = TRUE)
+shipping_coords_segmented <- shipping_coords_segmented %>%
+  mutate(
+    is_break = ifelse(dist_to_next > jump_thresh, 1, 0),
+    is_break = coalesce(is_break, 0)
+  ) %>%
+  group_by(original_id) %>%
+  mutate(segment_id = cumsum(is_break)) %>%
+  ungroup() %>%
+  mutate(id = paste(original_id, segment_id))
+```
+
+```{r mask-land}
+# Vectorized land mask function
+is_land_vec <- function(lon, lat, da) {
+  mask_val <- extract_mask(da, cbind(lon, lat))
+  is.na(mask_val)
+}
+
+shipping_coords_masked <- shipping_coords_segmented %>%
+  group_by(id) %>%
+  mutate(
+    lon_next = lead(lon),
+    lat_next = lead(lat)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # Mask segments where either endpoint is on land
+    on_land_start = is_land_vec(lon, lat, da),
+    on_land_end   = is_land_vec(lon_next, lat_next, da),
+    to_mask = on_land_start | on_land_end
+  ) %>%
+  filter(is.na(dist_to_next) | !to_mask)
+```
+
+
+
+```{r filter-canals}
+
+# Vectorized land mask function
+is_land_vec <- function(lon, lat, da) {
+  mask_val <- extract_mask(da, cbind(lon, lat))
+  is.na(mask_val)
+}
+
+shipping_coords_masked <- shipping_coords_segmented %>%
+  group_by(id) %>%
+  mutate(
+    lon_next = lead(lon),
+    lat_next = lead(lat)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # Mask segments where either endpoint is on land
+    on_land_start = is_land_vec(lon, lat, da),
+    on_land_end   = is_land_vec(lon_next, lat_next, da),
+    to_mask = on_land_start | on_land_end,
+    # Mask segments where projected jump is too large (artifact)
+    to_artifact = dist_to_next > jump_thresh
+  ) %>%
+  # Only keep segments that are NOT artifacts and NOT crossing land
+  filter((is.na(dist_to_next) | (!to_mask & !to_artifact)))
+```
+
+
+```{r load-choekholds}
+
+choke_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_chokepoints_database/FeatureServer/0/",
+  "query?where=1=1&outFields=portid,portname,lat,lon,",
+  "vessel_count_total&f=geojson"
+)
+
+choke_raw <- sf::read_sf(choke_url)
+
+# Extract and convert to Spilhaus coordinates
+choke_df <- data.frame(
+  lon  = choke_raw$lon,
+  lat  = choke_raw$lat,
+  vcnt = choke_raw$vessel_count_total,
+  name = choke_raw$portname
+)
+choke_xy <- from_lonlat_to_spilhaus_xy(choke_df$lon, choke_df$lat)
+choke_df$x <- choke_xy[, 1]
+choke_df$y <- choke_xy[, 2]
+```
+
+```{r load-ports}
+
+# IMF Port Watch ports endpoint (GeoJSON)
+ports_url <- paste0(
+  "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/",
+  "services/PortWatch_ports_database/FeatureServer/0/",
+  "query?where=1=1&outFields=portid,portname,lat,lon,country&f=geojson"
+)
+
+ports_raw <- sf::read_sf(ports_url)
+
+# Prepare and project port coordinates
+ports_df <- data.frame(
+  lon     = ports_raw$lon,
+  lat     = ports_raw$lat,
+  name    = ports_raw$portname,
+  country = ports_raw$country,
+  stringsAsFactors = FALSE
+)
+ports_xy <- from_lonlat_to_spilhaus_xy(ports_df$lon, ports_df$lat)
+ports_df$x <- ports_xy[, 1]
+ports_df$y <- ports_xy[, 2]
+```
+
+
+
+### Making Maps 
+```{r map-global-maritime-trade}
+
+
+# 1. Define key geographic markers in lon/lat
+geo_labels_ll <- data.frame(
+  lon = c(80, -110, -20, 0),
+  lat = c(-30, -20, -40, 100),
+  label = c(
+            "Indian Ocean",
+            "Pacific Ocean",
+            "South Atlantic",
+            "Arctic Ocean"),
+  nudge_x = c( 0,  5,  1, 60),
+  nudge_y = c( -5, -3,  3,  -90)
+)
+
+
+# 2. Project to Spilhaus coordinates and name columns
+geo_xy <- from_lonlat_to_spilhaus_xy(geo_labels_ll$lon, geo_labels_ll$lat)
+colnames(geo_xy) <- c("x", "y")
+
+# Combine with labels
+geo_labels <- cbind(geo_labels_ll, geo_xy)
+
+
+# 3. Plot with annotations
+ggplot() +
+  geom_tile(data = bkgr, aes(x, y), fill = "#dbefff") +
+  geom_tile(data = bkgr[bkgr$land == TRUE, ], aes(x, y), fill = "gray90") +
+  geom_point(data = coast, aes(x, y), colour = "#dbefff", size = 0.1, pch = ".") +
+  geom_path(data = shipping_coords_masked, aes(x, y, group = id),
+            colour = "dodgerblue", alpha = 0.8, linewidth = 0.3) +
+#  geom_point(data = choke_df,
+#             aes(x = x, y = y, size = vcnt),
+#             shape = 21, fill = NA, colour = "orange",
+#             alpha = 1, stroke = 1) +
+  geom_point(data = choke_df,
+           aes(x = x, y = y, size = vcnt),
+           shape = 21, fill = NA, colour = "orange",
+           alpha = 1, stroke = 1) +
+           scale_size_continuous(
+             name = "Annual vessel count",  # <-- Updated legend title
+             range = c(1, 15)               # You can keep or tweak the range
+             ) +
+  geom_point(data = ports_df,
+             aes(x = x, y = y),
+             shape = 21, fill = "dodgerblue", colour = "black",
+             alpha = 0.3, size = 1, stroke = 0) +
+  # Labels for geographic markers
+geom_text(data = geo_labels,
+          aes(x = x, y = y, label = label),
+          color = "gray60", fontface = "italic", size = 3) +
+  coord_equal() + theme_void() +
+  theme(
+    panel.background = element_rect(fill = "gray100", colour = "gray100"),
+    plot.title = element_text(size = 11),
+    plot.caption = element_text(size = 10),
+    legend.position = c(0.92, 0.82)
+  ) +
+  labs(
+    title   = "Global Maritime Trade",
+    subtitle = "Shipping routes, chokepoints and ports",
+    caption = "Data Sources: Benden, P. (2022), IMF PortWatch, and NOAA for the land mask"
+  )
+```
+
+
+
+
+```{r map-global-maritime-trade-2}
+
+# Filter chokepoints for high traffic
+choke_labels <- choke_df %>%
+  filter(vcnt >= 65000)
+
+ggplot() +
+  geom_tile(data = bkgr, aes(x, y), fill = "#dbefff") +
+  geom_tile(data = bkgr[bkgr$land == TRUE, ], aes(x, y), fill = "gray90") +
+  geom_point(data = coast, aes(x, y), colour = "#dbefff", size = 0.1, pch = ".") +
+  geom_path(data = shipping_coords_masked, aes(x, y, group = id),
+            colour = "dodgerblue", alpha = 0.8, linewidth = 0.3) +
+  geom_point(data = choke_df,
+             aes(x = x, y = y, size = vcnt),
+             shape = 21, fill = NA, colour = "orange",
+             alpha = 1, stroke = 1) +
+  scale_size_continuous(
+    name = "Annual vessel count",
+    range = c(1, 15)
+  ) +
+  geom_point(data = ports_df,
+             aes(x = x, y = y),
+             shape = 21, fill = "dodgerblue", colour = "black",
+             alpha = 0.3, size = 1, stroke = 0) +
+  # Labels for geographic markers
+  geom_text(data = geo_labels,
+            aes(x = x, y = y, label = label),
+            color = "gray60", fontface = "italic", size = 3) +
+  # Labels for large chokepoints
+  geom_text(data = choke_labels,
+            aes(x = x, y = y, label = name),
+            color = "gray30", size = 2.5, vjust = -5) +
+  coord_equal() + theme_void() +
+  theme(
+    panel.background = element_rect(fill = "gray100", colour = "gray100"),
+    plot.title = element_text(size = 11),
+    plot.caption = element_text(size = 10),
+    legend.position = c(0.92, 0.82)
+  ) +
+  labs(
+    title   = "Global Maritime Trade",
+    subtitle = "Shipping routes, chokepoints and ports",
+    caption = "Data Sources: Benden, P. (2022), IMF PortWatch, and NOAA for the land mask"
+  )
+
+
+```
+
+
+
+```{r making-labels}
+
+# 1. Define key geographic markers in lon/lat
+geo_labels_ll <- data.frame(
+  lon = c(80, -110, -20, 0),
+  lat = c(-30, -20, -40, 100),
+  label = c(
+            "Indian Ocean",
+            "Pacific Ocean",
+            "South Atlantic",
+            "Arctic Ocean"),
+  nudge_x = c( 0,  5,  1, 60),
+  nudge_y = c( -5, -3,  3,  -90)
+)
+
+
+# 2. Project to Spilhaus coordinates and name columns
+geo_xy <- from_lonlat_to_spilhaus_xy(geo_labels_ll$lon, geo_labels_ll$lat)
+colnames(geo_xy) <- c("x", "y")
+
+# Combine with labels
+geo_labels <- cbind(geo_labels_ll, geo_xy)
+
+
+# Filter chokepoints for high traffic
+choke_labels <- choke_df %>%
+  filter(vcnt >= 65000)
+```
+
+
+
+```{r map-global-maritime-trade-3}
+
+ggplot() +
+  geom_tile(data = bkgr, aes(x, y), fill = "#dbefff") +
+  geom_tile(data = bkgr[bkgr$land == TRUE, ], aes(x, y), fill = "gray90") +
+  geom_point(data = coast, aes(x, y), colour = "#dbefff", size = 0.1, pch = ".") +
+  geom_path(
+    data = shipping_coords_masked,
+    aes(x = x, y = y, group = id, size = type),  # thickness by type
+    colour = "dodgerblue", alpha = 0.8
+  ) +
+  scale_size_manual(
+    name = "Shipping route type",
+    values = c("Major" = 1.2, "Middle" = 0.7, "Minor" = 0.3)  # tweak as needed
+  ) +
+  geom_point(data = choke_df,
+             aes(x = x, y = y, size = vcnt),
+             shape = 21, fill = NA, colour = "orange",
+             alpha = 1, stroke = 1) +
+  scale_size_continuous(
+    name = "Annual vessel count",
+    range = c(1, 15),
+    guide = "legend"
+  ) +
+  geom_point(data = ports_df,
+             aes(x = x, y = y),
+             shape = 21, fill = "dodgerblue", colour = "black",
+             alpha = 0.3, size = 1, stroke = 0) +
+  geom_text(data = geo_labels,
+            aes(x = x, y = y, label = label),
+            color = "gray60", fontface = "italic", size = 3) +
+  geom_text(data = choke_labels,
+            aes(x = x, y = y, label = name),
+            color = "gray30", size = 2.5, vjust = -5) +
+  coord_equal() + theme_void() +
+  theme(
+    panel.background = element_rect(fill = "gray100", colour = "gray100"),
+    plot.title = element_text(size = 11),
+    plot.caption = element_text(size = 10),
+    legend.position = c(0.92, 0.82)
+  ) +
+  labs(
+    title   = "Global Maritime Trade",
+    subtitle = "Shipping routes by type, chokepoints and ports",
+    caption = "Data Sources: Benden, P. (2022), IMF PortWatch, and NOAA for the land mask"
+  )
+```
+
