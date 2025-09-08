@@ -11,8 +11,6 @@ Since the relation between maritime trade and the US naval security guarantee ha
 
  ## Maritime Trade Routes, Chokepoints, and Ports
  
- <img width="468" height="44" alt="image" src="https://github.com/user-attachments/assets/f5f13fea-4a8c-4fe3-a6de-f26a2ed30b09" />
-
  <p align="center">
   <img src="maps/spilhaus_map_1.png" width="600"/>
 </p>
