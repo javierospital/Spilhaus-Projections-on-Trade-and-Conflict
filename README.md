@@ -30,7 +30,7 @@ However, China has extended it's naval reach through the financing and onstructi
   <img src="maps/spilhaus_map_2.2.png" width="700"/>
 </p>
 
-The two maps influence maps above use inverse distance weighting, so that the influece of a port decreases with distance, based on the nearest 20 neighbours.The comparison highlights how China’s dual-purpose port investments have extended its maritime footprint—especially in strategic transit zones like chokepoints and shipping corridors.  In particular, China seems to have gained reach over NATO in the Southern Atlantic, as well as other parts of the Indian Ocean. Finally, the last map includes in orange the change introduced by the construction of dual-purpose ports.
+The two maps influence maps above use inverse distance weighting, so that the influece of a port decreases with distance, based on the nearest 20 neighbours. This means that each cell of the ocean's surface is painted according to the country or country-group of its 20 closes ports or military bases. The comparison highlights how China’s dual-purpose port investments have extended its maritime footprint—especially in strategic transit zones like chokepoints and shipping corridors.  In particular, China seems to have gained reach over NATO in the Southern Atlantic, as well as other parts of the Indian Ocean. Finally, the last map includes in orange the change introduced by the construction of dual-purpose ports.
 
  <p align="center">
   <img src="maps/spilhaus_map_2.3.png" width="700"/>
