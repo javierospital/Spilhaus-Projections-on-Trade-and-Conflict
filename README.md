@@ -33,7 +33,7 @@ However, China has extended it's naval reach through the financing and onstructi
   <img src="maps/spilhaus_map_2.2.png" width="700"/>
 </p>
 
-
+The two maps influence maps above use inverse distance weighting, so that the influece of a port decreases with distance, based on the nearest 20 neighbours.The comparison highlights how China’s dual-purpose port investments have extended its maritime footprint—especially in strategic transit zones like chokepoints and shipping corridors.  In particular, China seems to have gained reach over NATO in the Southern Atlantic, as well as other parts of the Indian Ocean. Finally, the last map includes in orange the change introduced by the construction of dual-purpose ports.
 
  <p align="center">
   <img src="maps/spilhaus_map_2.3.png" width="700"/>
@@ -42,6 +42,14 @@ However, China has extended it's naval reach through the financing and onstructi
 
 ## Trade Routes Overlaid on Smoothed Maritime Influence Map
 
+
+The last map overlays shipping route dataset on the previous maritime influence map. Routes were classified by importance (Major, Middle, Minor, corresponding to vessel frequency) and overlaid with matching line weights. The purpose of this is to show how the network of trade routes intersects with zones of maritime influence, emphasizing where strategic port reach aligns with global trade arteries. 
+
  <p align="center">
   <img src="maps/spilhaus_map_3.png" width="700"/>
 </p>
+
+While NATO still covers the two most important oceans for trade routes; China has gained influence over the Strait of Malacca, a critical chokepoint, as well as over the at-times critical contour of western Africa.
+
+<img width="468" height="59" alt="image" src="https://github.com/user-attachments/assets/19dec759-cbea-4062-ae16-920832a0c62f" />
+
