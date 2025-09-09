@@ -21,7 +21,7 @@ Since the relation between maritime trade and the US naval security guarantee ha
   <img src="maps/spilhaus_map_1.png" width="600"/>
 </p>
 
-
+Note above the density of trade routes on the North Atlantic and over the Pacific. These join Western Europe to the North American East Coast, and South East Asia (SEA) to the North American Western Coast. There are also to clusters of chokepoints, on SEA and around Europe. 
 ## Comparative Reach With and Without Dual-Purpose Ports 
 
  <p align="center">
