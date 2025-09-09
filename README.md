@@ -25,6 +25,10 @@ Note above the density of trade routes on the North Atlantic and over the Pacifi
 
 ## Comparative Reach With and Without Dual-Purpose Ports 
 
+While the map above may emphasize global connectivity over the oceans, this surface is also the subject of political conflcit. The following maps overlay overseas military bases and dual-purpose ports to offer a sense of the influence NATO and China over the world's oceans. It relies on the **Overseas Military Bases** dataset by Chun Yin Man and David Alexander Palmer, hosted on HKU’s DataHub. It provides tabular and geospatial data on the overseas military bases of eight global powers (including China), covering information up to **November 2020**, and was first posted on **14 August 2022**. Access it [here](https://datahub.hku.hk/articles/dataset/Overseas_Military_Bases/20438805). 
+
+However, China has extended it's naval reach through the financing and onstruction of ports around the world. These efforts are being tracked by Zongyuan Zoe Liu at the Council on Foreign Relations (CFR). Last updated on **August 26 2024**, it visualizes Chinese investments and ownership stakes in global port projects (129 total, 115 currently active), and assesses their military dual-use potential. View it [here](https://www.cfr.org/tracker/china-overseas-ports). By displaying dual-purpose ports in which there is a majority chinese ownership, we offer a sense of how the use of this resource could have extende Chinese maritime influence. 
+
  <p align="center">
   <img src="maps/spilhaus_map_2.2.png" width="700"/>
 </p>
