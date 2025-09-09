@@ -46,4 +46,4 @@ The last map overlays shipping route dataset on the previous maritime influence 
   <img src="maps/spilhaus_map_3.png" width="700"/>
 </p>
 
-While NATO still covers the two most important oceans for trade routes; China has gained influence over the Strait of Malacca, a critical chokepoint, as well as over the at-times critical contour of Western Africa.
+While NATO still covers the two most important oceans for trade routes; China has gained influence over the Strait of Malacca, a critical chokepoint, as well as over the at-times critical contour of Western Africa. This data could now be used to create an index on the influence o
